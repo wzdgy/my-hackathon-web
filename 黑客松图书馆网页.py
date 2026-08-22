@@ -4,6 +4,7 @@ import copy
 import datetime as dt
 import html
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,30 @@ def search_books(query: str) -> list[tuple[str, dict[str, str]]]:
     return [(isbn, info) for isbn, info in BOOKS_DATABASE.items() if normalized in isbn or normalized in info["name"].lower() or normalized in info["author"].lower() or normalized in info["theme"].lower()]
 
 
+def get_all_messages() -> list[dict[str, Any]]:
+    """将按 ISBN 分组的留言展开为统一列表。"""
+    all_messages: list[dict[str, Any]] = []
+    grouped_messages = st.session_state.get("messages", {})
+
+    if not isinstance(grouped_messages, dict):
+        return all_messages
+
+    for isbn, message_list in grouped_messages.items():
+        if not isinstance(message_list, list):
+            continue
+
+        book_name = BOOKS_DATABASE.get(isbn, {}).get("name", isbn)
+        for message in message_list:
+            if isinstance(message, dict):
+                all_messages.append({
+                    **message,
+                    "isbn": isbn,
+                    "book": book_name,
+                })
+
+    return all_messages
+
+
 def hot_books(limit: int = 6) -> list[tuple[str, dict[str, str], int]]:
     visits = st.session_state.hot_data.get("book_visits", {})
     ranked = [(isbn, info, int(visits.get(isbn, 0))) for isbn, info in BOOKS_DATABASE.items()]
@@ -208,7 +233,7 @@ def render_hot_sections() -> None:
 
 
 def render_timeline() -> None:
-    messages = [(isbn, entry) for isbn, entries in st.session_state.messages.items() for entry in entries]
+    messages = [(message["isbn"], message) for message in get_all_messages()]
     messages.sort(key=lambda item: item[1].get("date", ""), reverse=True)
     st.subheader("⏳ 历史回响")
     if not messages:
@@ -221,6 +246,35 @@ def render_timeline() -> None:
         date = html.escape(str(message.get("date", "")))
         book_name = html.escape(BOOKS_DATABASE.get(isbn, {}).get("name", isbn))
         st.markdown(f"<div class='message-card'><div class='message-meta'><strong>@{user}</strong><span>{date}</span></div><div class='message-book'>📖 {book_name} · {subject}</div><div class='ink-text'>“{content}”</div></div>", unsafe_allow_html=True)
+
+
+def render_message_statistics() -> None:
+    """显示所有留言数量及每本书的留言统计。"""
+    all_messages = get_all_messages()
+    st.subheader("📊 留言统计")
+
+    if not all_messages:
+        st.info("暂时没有留言统计数据。")
+        return
+
+    book_counts = Counter(message["isbn"] for message in all_messages)
+    statistics = []
+    for isbn, count in book_counts.most_common():
+        book_info = BOOKS_DATABASE.get(isbn, {})
+        statistics.append({
+            "书名": book_info.get("name", isbn),
+            "作者": book_info.get("author", "未知作者"),
+            "ISBN": isbn,
+            "留言数量": count,
+        })
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("全部留言", len(all_messages))
+    with col2:
+        st.metric("涉及书籍", len(book_counts))
+
+    st.dataframe(statistics, hide_index=True, use_container_width=True)
 
 
 def render_message_detail(isbn: str, index: int) -> None:
@@ -357,4 +411,5 @@ else:
     if not st.session_state.search_query:
         st.info("请在左侧输入书名、作者或 ISBN，开始探索书籍与历史留言。")
     render_hot_sections()
+    render_message_statistics()
     render_timeline()
