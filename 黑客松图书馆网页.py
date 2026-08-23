@@ -89,20 +89,42 @@ def password_hash(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def admin_password_from_secrets():
+def admin_accounts_from_secrets():
+    """读取多管理员配置，兼容旧版单管理员 Secrets。"""
+    accounts = {}
     try:
         secrets = st.secrets
+        admins = secrets.get("admins", {})
+        if hasattr(admins, "items"):
+            for account, config in admins.items():
+                account = str(account).strip()
+                if not account:
+                    continue
+                if hasattr(config, "get"):
+                    password = config.get("password", config.get("admin_password", ""))
+                    name = config.get("name", "管理员")
+                else:
+                    password = config
+                    name = "管理员"
+                if str(password).strip():
+                    accounts[account] = {"password": str(password), "name": str(name).strip() or "管理员"}
+
+        # 兼容旧配置：admin_password / ADMIN_PASSWORD 或 [admin] password
         for key in ("admin_password", "ADMIN_PASSWORD"):
             if key in secrets and str(secrets[key]).strip():
-                return str(secrets[key])
+                accounts.setdefault(ADMIN_ACCOUNT, {"password": str(secrets[key]), "name": "管理员"})
         admin = secrets.get("admin", {})
-        if isinstance(admin, dict):
+        if hasattr(admin, "get"):
             for key in ("password", "admin_password"):
                 if str(admin.get(key, "")).strip():
-                    return str(admin[key])
+                    accounts.setdefault(ADMIN_ACCOUNT, {"password": str(admin[key]), "name": "管理员"})
     except Exception:
-        pass
-    return None
+        return accounts
+    return accounts
+
+
+def is_reserved_admin_account(account):
+    return account == ADMIN_ACCOUNT or account in admin_accounts_from_secrets()
 
 
 def current_user():
@@ -264,7 +286,7 @@ def account_panel():
         if submitted:
             if not account.strip() or not password:
                 st.sidebar.error("账号和密码不能为空。")
-            elif account.strip() == ADMIN_ACCOUNT:
+            elif is_reserved_admin_account(account.strip()):
                 st.sidebar.error("管理员账号不能注册为普通用户。")
             elif account.strip() in st.session_state.users:
                 st.sidebar.error("该账号已存在。")
@@ -281,10 +303,11 @@ def account_panel():
             submitted = st.form_submit_button("登录", use_container_width=True)
         if submitted:
             account = account.strip()
-            admin_password = admin_password_from_secrets()
-            if account == ADMIN_ACCOUNT:
-                if admin_password and password == admin_password:
-                    st.session_state.user = {"account": ADMIN_ACCOUNT, "name": "管理员", "role": "admin"}
+            admin_accounts = admin_accounts_from_secrets()
+            admin = admin_accounts.get(account)
+            if admin:
+                if password == admin["password"]:
+                    st.session_state.user = {"account": account, "name": admin["name"], "role": "admin"}
                     st.rerun()
                 st.sidebar.error("管理员密码不正确，或未在 Streamlit Secrets 中配置。")
             else:
