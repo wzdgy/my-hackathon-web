@@ -1,6 +1,5 @@
 import datetime as dt
 import hashlib
-import html
 import json
 import uuid
 from collections import Counter
@@ -58,10 +57,12 @@ def write_json(path, value):
 def normalize_comment(comment, fallback_id):
     normalized = dict(comment) if isinstance(comment, dict) else {}
     normalized["id"] = str(normalized.get("id") or fallback_id)
-    normalized["likes"] = [str(account) for account in normalized.get("likes", []) if str(account).strip()]
+    likes = normalized.get("likes", [])
+    normalized["likes"] = [str(account) for account in likes if str(account).strip()] if isinstance(likes, list) else []
+    replies = normalized.get("replies", [])
     normalized["replies"] = [
         normalize_comment(reply, f"{normalized['id']}-reply-{index}")
-        for index, reply in enumerate(normalized.get("replies", []))
+        for index, reply in enumerate(replies if isinstance(replies, list) else [])
         if isinstance(reply, dict)
     ]
     return normalized
@@ -362,50 +363,104 @@ def add_reply(isbn, parent_id, content):
 
 
 def show_book_card(isbn, book, count):
-    st.markdown(
-        f"<div class='book-card'><div class='book-title'>{book['icon']} {html.escape(book['name'])}</div>"
-        f"<div>作者：{html.escape(book['author'])}</div><div>主题：{html.escape(book['theme'])}</div>"
-        f"<div class='hot-count'>🔥 留言 {count} 条</div></div>",
-        unsafe_allow_html=True,
-    )
-    if st.button("查看留言", key=f"book_{isbn}", use_container_width=True):
+    st.write(f"{book['icon']} **{book['name']}**")
+    st.caption(f"作者：{book['author']} · 主题：{book['theme']} · 留言：{count}")
+    if st.button("查看留言", key=f"book_{isbn}"):
         open_book(isbn)
 
 
-def render_comment(comment, isbn, index, depth=0, include_replies=True):
-    comment_id = str(comment.get("id", f"comment-{index}"))
-    name = html.escape(str(comment.get("name", "匿名用户")))
-    content = html.escape(str(comment.get("content", "")))
-    date = html.escape(str(comment.get("date", comment.get("timestamp", ""))))
+def comment_likes(comment):
+    return len({str(item) for item in comment.get("likes", [])})
+
+
+def reply_state_key(isbn, comment_id):
+    return f"{isbn}:{comment_id}"
+
+
+def render_replies(comment, isbn, depth):
+    replies = sorted(comment.get("replies", []), key=comment_likes, reverse=True)
+    if not replies:
+        return
+    state_key = reply_state_key(isbn, comment.get("id"))
+    expanded = st.session_state.setdefault("expanded_replies", set())
+    if state_key not in expanded:
+        return
+    limit_state = st.session_state.setdefault("reply_limits", {})
+    limit = limit_state.get(state_key, 5)
+    for index, reply in enumerate(replies[:limit]):
+        render_comment(reply, isbn, index, depth + 1, include_replies=True)
+    if limit < len(replies):
+        remaining = len(replies) - limit
+        if st.button(f"查看更多回复（还剩 {remaining} 条）", key=f"more_replies_{isbn}_{comment.get('id')}"):
+            limit_state[state_key] = limit + 5
+            st.rerun()
+
+
+def render_comment_body(comment, isbn, depth, include_replies):
+    comment_id = str(comment.get("id") or "comment")
+    name = str(comment.get("name", "匿名用户"))
+    content = str(comment.get("content", ""))
+    date = str(comment.get("date", comment.get("timestamp", "")))
     likes = [str(item) for item in comment.get("likes", [])]
-    subject = comment.get("subject")
-    title = f"📜 {html.escape(str(subject))}" if subject else f"↳ 回复 @{name}"
-    margin = min(depth * 28, 280)
-    st.markdown(
-        f"<div class='comment-card' style='margin-left:{margin}px'><div class='message-meta'><b>{title}</b><span>{date}</span></div>"
-        f"<div class='message-book'>@{name}</div><div class='ink-text'>{content}</div></div>",
-        unsafe_allow_html=True,
-    )
+    state_key = reply_state_key(isbn, comment_id)
+    expanded_replies = st.session_state.setdefault("expanded_replies", set())
+    reply_target = st.session_state.get("reply_target")
+    st.write(content)
+    st.caption(date)
     action_columns = st.columns([1, 1, 1, 5])
     liked = current_user() and str(current_user().get("account")) in likes
-    if action_columns[0].button(f"{'👎 取消点赞' if liked else '👍 点赞'} ({len(likes)})", key=f"like_{isbn}_{comment_id}"):
+    if action_columns[0].button(
+        f"{'取消点赞' if liked else '点赞'}（{comment_likes(comment)}）",
+        key=f"like_{isbn}_{comment_id}",
+    ):
         toggle_like(isbn, comment_id)
     if can_delete(comment) and action_columns[1].button("删除", key=f"delete_{isbn}_{comment_id}"):
         delete_comment(isbn, comment_id)
-    if current_user():
+    if current_user() and action_columns[2].button("回复", key=f"reply_{isbn}_{comment_id}"):
+        st.session_state.reply_target = (isbn, comment_id)
+        st.rerun()
+    elif not current_user():
+        action_columns[2].caption("登录后可互动")
+
+    if current_user() and reply_target == (isbn, comment_id):
         with st.form(f"reply_form_{isbn}_{comment_id}"):
             reply_content = st.text_area("回复内容", key=f"reply_text_{isbn}_{comment_id}", height=70)
-            reply_submitted = st.form_submit_button("回复")
+            reply_submitted = st.form_submit_button("提交回复")
         if reply_submitted:
             if reply_content.strip():
                 add_reply(isbn, comment_id, reply_content)
             else:
                 st.warning("回复内容不能为空。")
-    elif depth == 0:
-        action_columns[2].caption("登录后可点赞和回复")
-    if include_replies:
-        for child_index, reply in enumerate(comment.get("replies", [])):
-            render_comment(reply, isbn, child_index, depth + 1, include_replies=True)
+
+    reply_count = len(comment.get("replies", []))
+    if reply_count:
+        if state_key in expanded_replies:
+            if st.button("收起回复", key=f"hide_replies_{isbn}_{comment_id}"):
+                expanded_replies.discard(state_key)
+                st.rerun()
+        elif st.button(f"查看回复（{reply_count}）", key=f"show_replies_{isbn}_{comment_id}"):
+            expanded_replies.add(state_key)
+            st.rerun()
+        if include_replies:
+            render_replies(comment, isbn, depth)
+
+
+def render_comment(comment, isbn, index, depth=0, include_replies=True):
+    comment_id = str(comment.get("id", f"comment-{index}"))
+    name = str(comment.get("name", "匿名用户"))
+    subject = comment.get("subject")
+    title = str(subject) if subject else f"回复 @{name}"
+    prefix = "" if depth == 0 else "↳ "
+    state_key = reply_state_key(isbn, comment_id)
+    expanded_replies = st.session_state.setdefault("expanded_replies", set())
+    reply_target = st.session_state.get("reply_target")
+    expander_open = reply_target == (isbn, comment_id) or state_key in expanded_replies
+    if depth == 0:
+        with st.expander(f"{prefix}{title} · @{name} · 👍 {comment_likes(comment)}", expanded=expander_open):
+            render_comment_body(comment, isbn, depth, include_replies)
+    else:
+        st.write(f"↳ {title} · @{name} · 👍 {comment_likes(comment)}")
+        render_comment_body(comment, isbn, depth, include_replies)
 
 
 def show_book_page(isbn):
@@ -416,7 +471,7 @@ def show_book_page(isbn):
     st.subheader(f"💬 留言列表（共 {len(entries)} 条）")
     if not entries:
         st.info("暂时没有留言。登录后可以留下第一条留言。")
-    for index, entry in enumerate(entries):
+    for index, entry in enumerate(sorted(entries, key=comment_likes, reverse=True)):
         render_comment(entry, isbn, index)
 
     st.subheader("✒️ 添加留言")
@@ -456,7 +511,11 @@ def show_my_messages():
         st.info("请先登录后查看我的留言。")
         return
     st.header("📝 我的留言")
-    mine = [comment for comment in all_comments() if comment.get("user_account") == user.get("account")]
+    mine = sorted(
+        [comment for comment in all_comments() if comment.get("user_account") == user.get("account")],
+        key=comment_likes,
+        reverse=True,
+    )
     if not mine:
         st.info("你还没有留言。")
         return
@@ -544,25 +603,6 @@ def account_panel():
                     st.session_state.page = "首页"
                     st.rerun()
                 st.sidebar.error("账号或密码错误。")
-
-
-st.markdown(
-    """
-    <style>
-    .stApp { background:#f4ecd8; color:#5c4033; font-family:Georgia,"Times New Roman",serif; }
-    section[data-testid="stSidebar"] { background:#eaddcf; border-right:2px solid #8b5a2b; }
-    h1,h2,h3 { color:#8b4513; }
-    .book-card,.comment-card { background:#fffaf0; border:1px solid #d2b48c; border-left:5px solid #8b4513; border-radius:6px; padding:15px; margin-bottom:12px; box-shadow:2px 2px 5px rgba(139,69,19,.12); }
-    .book-title { color:#8b4513; font-size:1.15rem; font-weight:bold; margin-bottom:8px; }
-    .hot-count,.message-book { color:#a0522d; }
-    .message-meta { display:flex; justify-content:space-between; color:#8b4513; }
-    .message-meta span { color:#a0522d; font-size:.8rem; }
-    .ink-text { color:#2f4f4f; white-space:pre-wrap; }
-    div.stButton > button { background:#8b4513 !important; color:white !important; border:1px solid #5c4033; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 
 for key, loader in (
