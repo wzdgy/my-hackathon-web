@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "messages_data.json"
 HOT_FILE = BASE_DIR / "hot_data.json"
 USERS_FILE = BASE_DIR / "users_data.json"
+NOTIFICATIONS_FILE = BASE_DIR / "notifications_data.json"
 ADMIN_ACCOUNT = "1419742865"
 
 BOOKS = {
@@ -54,14 +55,38 @@ def write_json(path, value):
         return False
 
 
+def normalize_comment(comment, fallback_id):
+    normalized = dict(comment) if isinstance(comment, dict) else {}
+    normalized["id"] = str(normalized.get("id") or fallback_id)
+    normalized["likes"] = [str(account) for account in normalized.get("likes", []) if str(account).strip()]
+    normalized["replies"] = [
+        normalize_comment(reply, f"{normalized['id']}-reply-{index}")
+        for index, reply in enumerate(normalized.get("replies", []))
+        if isinstance(reply, dict)
+    ]
+    return normalized
+
+
 def load_messages():
     data = read_json(DATA_FILE, EMPTY_MESSAGES)
-    return {str(isbn): entries for isbn, entries in data.items() if isinstance(entries, list)}
+    result = {}
+    for isbn, entries in data.items():
+        if isinstance(entries, list):
+            result[str(isbn)] = [
+                normalize_comment(entry, f"legacy-{isbn}-{index}")
+                for index, entry in enumerate(entries)
+            ]
+    return result
 
 
 def load_users():
     data = read_json(USERS_FILE, {})
     return data if isinstance(data, dict) else {}
+
+
+def load_notifications():
+    data = read_json(NOTIFICATIONS_FILE, {})
+    return {str(account): items for account, items in data.items() if isinstance(items, list)}
 
 
 def load_hot_data():
@@ -79,6 +104,10 @@ def save_messages():
 
 def save_users():
     write_json(USERS_FILE, st.session_state.users)
+
+
+def save_notifications():
+    write_json(NOTIFICATIONS_FILE, st.session_state.notifications)
 
 
 def save_hot_data():
@@ -109,7 +138,6 @@ def admin_accounts_from_secrets():
                 if str(password).strip():
                     accounts[account] = {"password": str(password), "name": str(name).strip() or "管理员"}
 
-        # 兼容旧配置：admin_password / ADMIN_PASSWORD 或 [admin] password
         for key in ("admin_password", "ADMIN_PASSWORD"):
             if key in secrets and str(secrets[key]).strip():
                 accounts.setdefault(ADMIN_ACCOUNT, {"password": str(secrets[key]), "name": "管理员"})
@@ -140,14 +168,38 @@ def all_messages():
     result = []
     for isbn, entries in st.session_state.messages.items():
         for index, message in enumerate(entries):
-            if not isinstance(message, dict):
-                continue
-            result.append({
-                **message,
-                "id": str(message.get("id", f"legacy-{isbn}-{index}")),
-                "isbn": isbn,
-                "book": BOOKS.get(isbn, {}).get("name", isbn),
-            })
+            if isinstance(message, dict):
+                result.append({
+                    **message,
+                    "id": str(message.get("id", f"legacy-{isbn}-{index}")),
+                    "isbn": isbn,
+                    "book": BOOKS.get(isbn, {}).get("name", isbn),
+                })
+    return result
+
+
+def flatten_comments(entries, isbn, book, parent_id=None, depth=0):
+    result = []
+    for index, comment in enumerate(entries):
+        if not isinstance(comment, dict):
+            continue
+        comment_id = str(comment.get("id", f"legacy-{isbn}-{depth}-{index}"))
+        result.append({
+            **comment,
+            "id": comment_id,
+            "isbn": isbn,
+            "book": book,
+            "parent_id": parent_id,
+            "depth": depth,
+        })
+        result.extend(flatten_comments(comment.get("replies", []), isbn, book, comment_id, depth + 1))
+    return result
+
+
+def all_comments():
+    result = []
+    for isbn, entries in st.session_state.messages.items():
+        result.extend(flatten_comments(entries, isbn, BOOKS.get(isbn, {}).get("name", isbn)))
     return result
 
 
@@ -167,22 +219,146 @@ def open_book(isbn):
     st.rerun()
 
 
-def can_delete(message):
+def find_comment(entries, comment_id):
+    for comment in entries:
+        if str(comment.get("id")) == str(comment_id):
+            return comment
+        found = find_comment(comment.get("replies", []), comment_id)
+        if found:
+            return found
+    return None
+
+
+def find_comment_path(entries, comment_id, path=None):
+    path = list(path or [])
+    for comment in entries:
+        current_path = path + [comment]
+        if str(comment.get("id")) == str(comment_id):
+            return current_path
+        found = find_comment_path(comment.get("replies", []), comment_id, current_path)
+        if found:
+            return found
+    return None
+
+
+def remove_comment(entries, comment_id):
+    for index, comment in enumerate(entries):
+        if str(comment.get("id")) == str(comment_id):
+            return entries.pop(index)
+        removed = remove_comment(comment.get("replies", []), comment_id)
+        if removed:
+            return removed
+    return None
+
+
+def comment_accounts(comment):
+    accounts = set()
+    account = str(comment.get("user_account", "")).strip()
+    if account:
+        accounts.add(account)
+    for reply in comment.get("replies", []):
+        accounts.update(comment_accounts(reply))
+    return accounts
+
+
+def can_delete(comment):
     user = current_user()
-    return bool(user and (is_admin() or message.get("user_account") == user.get("account")))
+    return bool(user and (is_admin() or comment.get("user_account") == user.get("account")))
 
 
-def delete_message(isbn, message_id):
+def notify_users(accounts, title, body):
+    recipients = {str(account).strip() for account in accounts if str(account).strip()}
+    actor = current_user()
+    if actor:
+        recipients.discard(str(actor.get("account", "")).strip())
+    if not recipients:
+        return
+    for account in recipients:
+        notifications = st.session_state.notifications.setdefault(account, [])
+        notifications.insert(0, {
+            "id": uuid.uuid4().hex,
+            "title": title,
+            "body": body,
+            "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "read": False,
+        })
+        st.session_state.notifications[account] = notifications[:100]
+    save_notifications()
+
+
+def delete_comment(isbn, comment_id):
     entries = st.session_state.messages.get(isbn, [])
-    for index, entry in enumerate(entries):
-        if str(entry.get("id")) == str(message_id):
-            if not can_delete({**entry, "isbn": isbn}):
-                st.error("你只能删除自己的留言。")
-                return
-            entries.pop(index)
-            save_messages()
-            st.success("留言已删除。")
-            st.rerun()
+    target = find_comment(entries, comment_id)
+    if not target:
+        st.warning("这条留言已经不存在。")
+        return
+    if not can_delete(target):
+        st.error("普通用户只能删除自己的留言。")
+        return
+    deleted_accounts = comment_accounts(target)
+    subject = str(target.get("subject", "留言"))
+    removed = remove_comment(entries, comment_id)
+    if removed is None:
+        return
+    save_messages()
+    if is_admin():
+        notify_users(
+            deleted_accounts,
+            "你的留言已被管理员删除",
+            f"《{BOOKS.get(isbn, {}).get('name', isbn)}》中的“{subject}”已被管理员删除。",
+        )
+    st.success("留言已删除。")
+    st.rerun()
+
+
+def toggle_like(isbn, comment_id):
+    user = current_user()
+    if not user:
+        st.info("请先登录后点赞。")
+        return
+    target = find_comment(st.session_state.messages.get(isbn, []), comment_id)
+    if not target:
+        return
+    account = str(user.get("account"))
+    likes = [str(item) for item in target.get("likes", [])]
+    if account in likes:
+        likes.remove(account)
+    else:
+        likes.append(account)
+    target["likes"] = likes
+    save_messages()
+    st.rerun()
+
+
+def add_reply(isbn, parent_id, content):
+    user = current_user()
+    if not user or not content.strip():
+        return
+    entries = st.session_state.messages.get(isbn, [])
+    parent = find_comment(entries, parent_id)
+    if not parent:
+        st.error("回复目标不存在。")
+        return
+    reply = {
+        "id": uuid.uuid4().hex,
+        "name": user.get("name", user.get("account")),
+        "user_account": user.get("account"),
+        "content": content.strip(),
+        "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "likes": [],
+        "replies": [],
+    }
+    parent.setdefault("replies", []).append(reply)
+    path = find_comment_path(entries, parent_id) or [parent]
+    recipients = {comment.get("user_account") for comment in path if comment.get("user_account")}
+    notify_users(
+        recipients,
+        "你的留言收到新回复",
+        f"有人回复了你在《{BOOKS.get(isbn, {}).get('name', isbn)}》下的留言：“{content.strip()[:80]}”。",
+    )
+    save_messages()
+    st.success("回复已发布。")
+    st.rerun()
 
 
 def show_book_card(isbn, book, count):
@@ -196,18 +372,40 @@ def show_book_card(isbn, book, count):
         open_book(isbn)
 
 
-def show_message(entry, isbn, index):
-    subject = html.escape(str(entry.get("subject", "未命名主题")))
-    name = html.escape(str(entry.get("name", "匿名用户")))
-    content = html.escape(str(entry.get("content", "")))
-    date = html.escape(str(entry.get("date", entry.get("timestamp", ""))))
+def render_comment(comment, isbn, index, depth=0, include_replies=True):
+    comment_id = str(comment.get("id", f"comment-{index}"))
+    name = html.escape(str(comment.get("name", "匿名用户")))
+    content = html.escape(str(comment.get("content", "")))
+    date = html.escape(str(comment.get("date", comment.get("timestamp", ""))))
+    likes = [str(item) for item in comment.get("likes", [])]
+    subject = comment.get("subject")
+    title = f"📜 {html.escape(str(subject))}" if subject else f"↳ 回复 @{name}"
+    margin = min(depth * 28, 280)
     st.markdown(
-        f"<div class='message-card'><div class='message-meta'><b>📜 {subject}</b><span>{date}</span></div>"
+        f"<div class='comment-card' style='margin-left:{margin}px'><div class='message-meta'><b>{title}</b><span>{date}</span></div>"
         f"<div class='message-book'>@{name}</div><div class='ink-text'>{content}</div></div>",
         unsafe_allow_html=True,
     )
-    if can_delete(entry) and st.button("删除此留言", key=f"delete_{isbn}_{entry.get('id', index)}"):
-        delete_message(isbn, entry.get("id", index))
+    action_columns = st.columns([1, 1, 1, 5])
+    liked = current_user() and str(current_user().get("account")) in likes
+    if action_columns[0].button(f"{'👎 取消点赞' if liked else '👍 点赞'} ({len(likes)})", key=f"like_{isbn}_{comment_id}"):
+        toggle_like(isbn, comment_id)
+    if can_delete(comment) and action_columns[1].button("删除", key=f"delete_{isbn}_{comment_id}"):
+        delete_comment(isbn, comment_id)
+    if current_user():
+        with st.form(f"reply_form_{isbn}_{comment_id}"):
+            reply_content = st.text_area("回复内容", key=f"reply_text_{isbn}_{comment_id}", height=70)
+            reply_submitted = st.form_submit_button("回复")
+        if reply_submitted:
+            if reply_content.strip():
+                add_reply(isbn, comment_id, reply_content)
+            else:
+                st.warning("回复内容不能为空。")
+    elif depth == 0:
+        action_columns[2].caption("登录后可点赞和回复")
+    if include_replies:
+        for child_index, reply in enumerate(comment.get("replies", [])):
+            render_comment(reply, isbn, child_index, depth + 1, include_replies=True)
 
 
 def show_book_page(isbn):
@@ -219,7 +417,7 @@ def show_book_page(isbn):
     if not entries:
         st.info("暂时没有留言。登录后可以留下第一条留言。")
     for index, entry in enumerate(entries):
-        show_message(entry, isbn, index)
+        render_comment(entry, isbn, index)
 
     st.subheader("✒️ 添加留言")
     if not current_user():
@@ -241,6 +439,8 @@ def show_book_page(isbn):
                     "user_account": user.get("account"),
                     "content": content.strip(),
                     "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "likes": [],
+                    "replies": [],
                 })
                 save_messages()
                 st.success("留言添加成功！")
@@ -256,19 +456,46 @@ def show_my_messages():
         st.info("请先登录后查看我的留言。")
         return
     st.header("📝 我的留言")
-    mine = [message for message in all_messages() if message.get("user_account") == user.get("account")]
+    mine = [comment for comment in all_comments() if comment.get("user_account") == user.get("account")]
     if not mine:
         st.info("你还没有留言。")
         return
-    for index, message in enumerate(mine):
-        st.markdown(f"#### {message['book']} · {message.get('subject', '未命名主题')}")
-        show_message(message, message["isbn"], index)
+    for index, comment in enumerate(mine):
+        st.markdown(f"#### {comment['book']} · {comment.get('subject', '回复')}")
+        render_comment(comment, comment["isbn"], index, depth=0, include_replies=False)
+
+
+def show_notifications():
+    user = current_user()
+    if not user:
+        st.info("请先登录后查看通知。")
+        return
+    account = str(user.get("account"))
+    notifications = st.session_state.notifications.setdefault(account, [])
+    st.header("🔔 通知")
+    if not notifications:
+        st.info("暂无通知。")
+        return
+    if st.button("全部标记为已读", key="mark_all_notifications"):
+        for notification in notifications:
+            notification["read"] = True
+        save_notifications()
+        st.rerun()
+    for notification in notifications:
+        prefix = "未读 · " if not notification.get("read") else ""
+        st.info(f"{prefix}{notification.get('title', '通知')}\n\n{notification.get('body', '')}\n\n{notification.get('date', '')}")
 
 
 def account_panel():
     user = current_user()
     if user:
-        st.sidebar.success(f"已登录：{user.get('name', user.get('account'))}{'（管理员）' if is_admin() else ''}")
+        account = str(user.get("account"))
+        unread = sum(1 for item in st.session_state.notifications.get(account, []) if not item.get("read"))
+        st.sidebar.success(f"已登录：{user.get('name', account)}{'（管理员）' if is_admin() else ''}")
+        if st.sidebar.button(f"🔔 通知 ({unread})", use_container_width=True):
+            st.session_state.page = "通知"
+            st.session_state.current_book = None
+            st.rerun()
         if st.sidebar.button("退出登录", use_container_width=True):
             st.session_state.user = None
             st.session_state.page = "首页"
@@ -303,17 +530,18 @@ def account_panel():
             submitted = st.form_submit_button("登录", use_container_width=True)
         if submitted:
             account = account.strip()
-            admin_accounts = admin_accounts_from_secrets()
-            admin = admin_accounts.get(account)
+            admin = admin_accounts_from_secrets().get(account)
             if admin:
                 if password == admin["password"]:
                     st.session_state.user = {"account": account, "name": admin["name"], "role": "admin"}
+                    st.session_state.page = "首页"
                     st.rerun()
                 st.sidebar.error("管理员密码不正确，或未在 Streamlit Secrets 中配置。")
             else:
                 saved = st.session_state.users.get(account)
                 if saved and saved.get("password") == password_hash(password):
                     st.session_state.user = {"account": account, "name": saved.get("name", account), "role": "user"}
+                    st.session_state.page = "首页"
                     st.rerun()
                 st.sidebar.error("账号或密码错误。")
 
@@ -324,7 +552,7 @@ st.markdown(
     .stApp { background:#f4ecd8; color:#5c4033; font-family:Georgia,"Times New Roman",serif; }
     section[data-testid="stSidebar"] { background:#eaddcf; border-right:2px solid #8b5a2b; }
     h1,h2,h3 { color:#8b4513; }
-    .book-card,.message-card { background:#fffaf0; border:1px solid #d2b48c; border-left:5px solid #8b4513; border-radius:6px; padding:15px; margin-bottom:12px; box-shadow:2px 2px 5px rgba(139,69,19,.12); }
+    .book-card,.comment-card { background:#fffaf0; border:1px solid #d2b48c; border-left:5px solid #8b4513; border-radius:6px; padding:15px; margin-bottom:12px; box-shadow:2px 2px 5px rgba(139,69,19,.12); }
     .book-title { color:#8b4513; font-size:1.15rem; font-weight:bold; margin-bottom:8px; }
     .hot-count,.message-book { color:#a0522d; }
     .message-meta { display:flex; justify-content:space-between; color:#8b4513; }
@@ -337,7 +565,12 @@ st.markdown(
 )
 
 
-for key, loader in (("messages", load_messages), ("users", load_users), ("hot_data", load_hot_data)):
+for key, loader in (
+    ("messages", load_messages),
+    ("users", load_users),
+    ("notifications", load_notifications),
+    ("hot_data", load_hot_data),
+):
     if key not in st.session_state:
         st.session_state[key] = loader()
 if "current_book" not in st.session_state:
@@ -377,6 +610,8 @@ if st.session_state.get("current_book"):
     show_book_page(st.session_state.current_book)
 elif st.session_state.get("page") == "我的留言":
     show_my_messages()
+elif st.session_state.get("page") == "通知":
+    show_notifications()
 else:
     messages = all_messages()
     if st.session_state.get("search_query"):
