@@ -64,6 +64,7 @@ def lookup_open_library(query):
         return []
 
     results = []
+    seen = set()
 
     for item in data.get("docs", []):
         isbn_list = item.get("isbn", [])
@@ -79,7 +80,13 @@ def lookup_open_library(query):
         )
 
         if not isbn:
+            # 部分中文书目没有 ISBN，但 Open Library 会提供稳定的作品 ID。
+            work_key = str(item.get("key", "")).strip()
+            if work_key:
+                isbn = "OL:" + work_key.rstrip("/").rsplit("/", 1)[-1]
+        if not isbn or isbn in seen:
             continue
+        seen.add(isbn)
 
         authors = item.get("author_name", [])
         subjects = item.get("subject", [])
@@ -129,6 +136,11 @@ def lookup_google_books(query):
             ),
             None,
         )
+        if not isbn:
+            # 没有 ISBN 时使用 Google Books volume ID，仍可保存到本地书库。
+            volume_id = str(item.get("id", "")).strip()
+            if volume_id:
+                isbn = "GB:" + volume_id
         if not isbn or isbn in seen:
             continue
         seen.add(isbn)
