@@ -72,7 +72,7 @@ def lookup_open_library(query):
             (
                 value.replace("-", "").replace(" ", "")
                 for value in isbn_list
-                if len(value.replace("-", "").replace(" ", "")) == 13
+                if len(value.replace("-", "").replace(" ", "")) in (10, 13)
                 and value.replace("-", "").replace(" ", "").isdigit()
             ),
             None,
@@ -92,6 +92,53 @@ def lookup_open_library(query):
             "icon": "📚",
         })
 
+    return results
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def lookup_google_books(query):
+    query = query.strip()
+    if not query:
+        return []
+
+    url = (
+        "https://www.googleapis.com/books/v1/volumes"
+        f"?q={quote(query)}&maxResults=10&printType=books"
+    )
+
+    try:
+        data = fetch_json(url)
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ):
+        return []
+
+    results = []
+    seen = set()
+    for item in data.get("items", []):
+        info = item.get("volumeInfo", {})
+        identifiers = info.get("industryIdentifiers", [])
+        isbn = next(
+            (
+                str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")
+                for identifier in identifiers
+                if len(str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")) in (10, 13)
+            ),
+            None,
+        )
+        if not isbn or isbn in seen:
+            continue
+        seen.add(isbn)
+        results.append({
+            "isbn": isbn,
+            "name": info.get("title", "未知书名"),
+            "author": "、".join(info.get("authors", [])[:3]) or "未知作者",
+            "theme": "、".join(info.get("categories", [])[:3]) or "未分类",
+            "icon": "📚",
+        })
     return results
 
 
@@ -762,6 +809,8 @@ with st.sidebar:
 
             if query and not st.session_state.search_results:
                 st.session_state.remote_results = lookup_open_library(query)
+                if not st.session_state.remote_results:
+                    st.session_state.remote_results = lookup_google_books(query)
     st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
