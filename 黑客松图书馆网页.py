@@ -349,6 +349,16 @@ def search_books(query):
         return [dict(row) for row in rows]
 
 
+def open_book(isbn):
+    """打开书籍留言页。"""
+    if get_book(isbn) is None:
+        st.error("书籍不存在或已被停用。")
+        return
+    st.session_state.current_book = isbn
+    st.session_state.page = "首页"
+    st.rerun()
+
+
 def comment_rows(isbn):
     with connect_db() as db:
         rows = db.execute(
