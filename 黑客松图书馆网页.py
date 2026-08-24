@@ -1,6 +1,7 @@
 import datetime as dt
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -152,6 +153,51 @@ def lookup_google_books(query):
             "icon": "📚",
         })
     return results
+
+
+AUTHOR_ALIASES = {
+    "shu qingchun": "老舍",
+    "she lao": "老舍",
+    "lao she": "老舍",
+    "舒庆春": "老舍",
+    "老舍": "老舍",
+}
+
+
+def contains_chinese(value):
+    return bool(re.search(r"[\u4e00-\u9fff]", str(value or "")))
+
+
+def canonical_author(author):
+    text = " ".join(str(author or "未知作者").strip().lower().split())
+    return AUTHOR_ALIASES.get(text, str(author or "未知作者").strip())
+
+
+def normalize_remote_results(results):
+    """优先中文书名，并删除同一作者同一书名的重复版本。"""
+    normalized = []
+    for book in results:
+        item = dict(book)
+        item["author"] = canonical_author(item.get("author"))
+        item["name"] = str(item.get("name", "未知书名")).strip() or "未知书名"
+        normalized.append(item)
+
+    # 同一搜索如果有中文标题，只保留中文标题，避免中英文版本同时出现。
+    chinese_titles = [item for item in normalized if contains_chinese(item.get("name"))]
+    if chinese_titles:
+        normalized = chinese_titles
+
+    unique = []
+    seen = set()
+    for item in normalized:
+        title_key = re.sub(r"[^\w\u4e00-\u9fff]", "", item["name"].lower())
+        author_key = re.sub(r"[^\w\u4e00-\u9fff]", "", item["author"].lower())
+        key = (title_key, author_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def admin_accounts_from_secrets():
@@ -823,6 +869,9 @@ with st.sidebar:
                 st.session_state.remote_results = lookup_open_library(query)
                 if not st.session_state.remote_results:
                     st.session_state.remote_results = lookup_google_books(query)
+                st.session_state.remote_results = normalize_remote_results(
+                    st.session_state.remote_results
+                )
     st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
