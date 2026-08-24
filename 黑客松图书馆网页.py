@@ -1,118 +1,25 @@
 import datetime as dt
 import hashlib
 import json
+import sqlite3
 import uuid
-from collections import Counter
 from pathlib import Path
 
 import streamlit as st
 
 
-st.set_page_config(
-    page_title="图书馆跨时空留言板",
-    page_icon="📜",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="图书馆跨时空留言板", page_icon="📚", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "messages_data.json"
-HOT_FILE = BASE_DIR / "hot_data.json"
-USERS_FILE = BASE_DIR / "users_data.json"
-NOTIFICATIONS_FILE = BASE_DIR / "notifications_data.json"
+DB_FILE = BASE_DIR / "library.db"
+LEGACY_MESSAGES = BASE_DIR / "messages_data.json"
+LEGACY_USERS = BASE_DIR / "users_data.json"
+LEGACY_NOTIFICATIONS = BASE_DIR / "notifications_data.json"
+LEGACY_HOT = BASE_DIR / "hot_data.json"
 ADMIN_ACCOUNT = "1419742865"
 
-BOOKS = {
-    "9787544291163": {"name": "百年孤独", "author": "加西亚·马尔克斯", "theme": "魔幻现实主义", "icon": "📚"},
-    "9787020002207": {"name": "红楼梦", "author": "曹雪芹", "theme": "古典文学", "icon": "🏮"},
-    "9787544253994": {"name": "三体", "author": "刘慈欣", "theme": "科幻", "icon": "🌌"},
-    "9787532769278": {"name": "活着", "author": "余华", "theme": "现实主义", "icon": "🕯️"},
-    "9787540480590": {"name": "围城", "author": "钱钟书", "theme": "讽刺文学", "icon": "🏛️"},
-    "9787020024759": {"name": "平凡的世界", "author": "路遥", "theme": "现实主义", "icon": "🌾"},
-}
-
-EMPTY_MESSAGES = {}
-EMPTY_HOT_DATA = {"hot_discussions": [], "hot_searches": [], "visit_stats": {}}
-
-
-def read_json(path, default):
-    if not path.exists():
-        return default.copy() if isinstance(default, dict) else list(default)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, type(default)) else default.copy()
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return default.copy() if isinstance(default, dict) else list(default)
-
-
-def write_json(path, value):
-    try:
-        path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True
-    except OSError as error:
-        st.error(f"数据保存失败：{error}")
-        return False
-
-
-def normalize_comment(comment, fallback_id):
-    normalized = dict(comment) if isinstance(comment, dict) else {}
-    normalized["id"] = str(normalized.get("id") or fallback_id)
-    likes = normalized.get("likes", [])
-    normalized["likes"] = [str(account) for account in likes if str(account).strip()] if isinstance(likes, list) else []
-    replies = normalized.get("replies", [])
-    normalized["replies"] = [
-        normalize_comment(reply, f"{normalized['id']}-reply-{index}")
-        for index, reply in enumerate(replies if isinstance(replies, list) else [])
-        if isinstance(reply, dict)
-    ]
-    return normalized
-
-
-def load_messages():
-    data = read_json(DATA_FILE, EMPTY_MESSAGES)
-    result = {}
-    for isbn, entries in data.items():
-        if isinstance(entries, list):
-            result[str(isbn)] = [
-                normalize_comment(entry, f"legacy-{isbn}-{index}")
-                for index, entry in enumerate(entries)
-            ]
-    return result
-
-
-def load_users():
-    data = read_json(USERS_FILE, {})
-    return data if isinstance(data, dict) else {}
-
-
-def load_notifications():
-    data = read_json(NOTIFICATIONS_FILE, {})
-    return {str(account): items for account, items in data.items() if isinstance(items, list)}
-
-
-def load_hot_data():
-    data = read_json(HOT_FILE, EMPTY_HOT_DATA)
-    return {
-        "hot_discussions": data.get("hot_discussions", []) if isinstance(data, dict) else [],
-        "hot_searches": data.get("hot_searches", []) if isinstance(data, dict) else [],
-        "visit_stats": data.get("visit_stats", {}) if isinstance(data, dict) else {},
-    }
-
-
-def save_messages():
-    write_json(DATA_FILE, st.session_state.messages)
-
-
-def save_users():
-    write_json(USERS_FILE, st.session_state.users)
-
-
-def save_notifications():
-    write_json(NOTIFICATIONS_FILE, st.session_state.notifications)
-
-
-def save_hot_data():
-    write_json(HOT_FILE, st.session_state.hot_data)
+def now_text():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def password_hash(password):
@@ -120,7 +27,6 @@ def password_hash(password):
 
 
 def admin_accounts_from_secrets():
-    """读取多管理员配置，兼容旧版单管理员 Secrets。"""
     accounts = {}
     try:
         secrets = st.secrets
@@ -134,21 +40,19 @@ def admin_accounts_from_secrets():
                     password = config.get("password", config.get("admin_password", ""))
                     name = config.get("name", "管理员")
                 else:
-                    password = config
-                    name = "管理员"
+                    password, name = config, "管理员"
                 if str(password).strip():
                     accounts[account] = {"password": str(password), "name": str(name).strip() or "管理员"}
-
         for key in ("admin_password", "ADMIN_PASSWORD"):
             if key in secrets and str(secrets[key]).strip():
                 accounts.setdefault(ADMIN_ACCOUNT, {"password": str(secrets[key]), "name": "管理员"})
-        admin = secrets.get("admin", {})
-        if hasattr(admin, "get"):
-            for key in ("password", "admin_password"):
-                if str(admin.get(key, "")).strip():
-                    accounts.setdefault(ADMIN_ACCOUNT, {"password": str(admin[key]), "name": "管理员"})
+        legacy_admin = secrets.get("admin", {})
+        if hasattr(legacy_admin, "get"):
+            password = legacy_admin.get("password", legacy_admin.get("admin_password", ""))
+            if str(password).strip():
+                accounts.setdefault(ADMIN_ACCOUNT, {"password": str(password), "name": "管理员"})
     except Exception:
-        return accounts
+        pass
     return accounts
 
 
@@ -165,342 +69,411 @@ def is_admin():
     return bool(user and user.get("role") == "admin")
 
 
-def all_messages():
-    result = []
-    for isbn, entries in st.session_state.messages.items():
-        for index, message in enumerate(entries):
-            if isinstance(message, dict):
-                result.append({
-                    **message,
-                    "id": str(message.get("id", f"legacy-{isbn}-{index}")),
-                    "isbn": isbn,
-                    "book": BOOKS.get(isbn, {}).get("name", isbn),
-                })
-    return result
+def can_delete(comment):
+    user = current_user()
+    return bool(user and (is_admin() or comment.get("user_account") == user.get("account")))
 
 
-def flatten_comments(entries, isbn, book, parent_id=None, depth=0):
-    result = []
-    for index, comment in enumerate(entries):
-        if not isinstance(comment, dict):
-            continue
-        comment_id = str(comment.get("id", f"legacy-{isbn}-{depth}-{index}"))
-        result.append({
-            **comment,
-            "id": comment_id,
-            "isbn": isbn,
-            "book": book,
-            "parent_id": parent_id,
-            "depth": depth,
-        })
-        result.extend(flatten_comments(comment.get("replies", []), isbn, book, comment_id, depth + 1))
-    return result
+def read_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, type(default)) else default
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return default
 
 
-def all_comments():
-    result = []
-    for isbn, entries in st.session_state.messages.items():
-        result.extend(flatten_comments(entries, isbn, BOOKS.get(isbn, {}).get("name", isbn)))
-    return result
+def connect_db():
+    connection = sqlite3.connect(DB_FILE, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def init_db():
+    with connect_db() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS books (
+                isbn TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT '',
+                theme TEXT NOT NULL DEFAULT '',
+                icon TEXT NOT NULL DEFAULT '📚',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                account TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS comments (
+                id TEXT PRIMARY KEY,
+                isbn TEXT NOT NULL REFERENCES books(isbn) ON DELETE RESTRICT,
+                parent_id TEXT REFERENCES comments(id) ON DELETE CASCADE,
+                subject TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                name TEXT NOT NULL,
+                user_account TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_comments_book_parent ON comments(isbn, parent_id);
+            CREATE TABLE IF NOT EXISTS comment_likes (
+                comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+                account TEXT NOT NULL,
+                PRIMARY KEY(comment_id, account)
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                account TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_read INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_notifications_account ON notifications(account, is_read);
+            CREATE TABLE IF NOT EXISTS searches (
+                query TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_used TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS visits (
+                visit_date TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        migrate_legacy_data(db)
+
+
+def normalize_legacy_comment(comment, fallback_id):
+    if not isinstance(comment, dict):
+        return None
+    return {
+        "id": str(comment.get("id") or fallback_id),
+        "subject": str(comment.get("subject", comment.get("message_title", ""))),
+        "content": str(comment.get("content", "")).strip(),
+        "name": str(comment.get("name", "匿名用户")),
+        "user_account": str(comment.get("user_account", comment.get("account", ""))),
+        "created_at": str(comment.get("date", comment.get("timestamp", now_text()))),
+        "likes": [str(item) for item in comment.get("likes", [])] if isinstance(comment.get("likes", []), list) else [],
+        "replies": comment.get("replies", []) if isinstance(comment.get("replies", []), list) else [],
+    }
+
+
+def migrate_comment(db, isbn, comment, parent_id=None, fallback_id=None):
+    item = normalize_legacy_comment(comment, fallback_id or uuid.uuid4().hex)
+    if not item or not item["content"]:
+        return
+    comment_id = item["id"]
+    exists = db.execute("SELECT 1 FROM comments WHERE id=?", (comment_id,)).fetchone()
+    if not exists:
+        db.execute(
+            "INSERT INTO comments(id,isbn,parent_id,subject,content,name,user_account,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (comment_id, isbn, parent_id, item["subject"], item["content"], item["name"], item["user_account"], item["created_at"]),
+        )
+        db.executemany(
+            "INSERT OR IGNORE INTO comment_likes(comment_id,account) VALUES(?,?)",
+            [(comment_id, account) for account in item["likes"] if account.strip()],
+        )
+    for index, reply in enumerate(item["replies"]):
+        migrate_comment(db, isbn, reply, comment_id, f"{comment_id}-reply-{index}")
+
+
+def migrate_legacy_data(db):
+    if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        users = read_json(LEGACY_USERS, {})
+        if isinstance(users, dict):
+            for account, user in users.items():
+                if isinstance(user, dict) and user.get("password"):
+                    db.execute(
+                        "INSERT OR IGNORE INTO users(account,name,password_hash,created_at) VALUES(?,?,?,?)",
+                        (str(account), str(user.get("name", account)), str(user["password"]), now_text()),
+                    )
+    if db.execute("SELECT COUNT(*) FROM comments").fetchone()[0] == 0:
+        messages = read_json(LEGACY_MESSAGES, {})
+        if isinstance(messages, dict):
+            for isbn, entries in messages.items():
+                if db.execute("SELECT 1 FROM books WHERE isbn=?", (str(isbn),)).fetchone() is None:
+                    db.execute(
+                        "INSERT INTO books(isbn,name,author,theme,icon,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
+                        (str(isbn), str(isbn), "", "", "📚", now_text()),
+                    )
+                for index, entry in enumerate(entries if isinstance(entries, list) else []):
+                    migrate_comment(db, str(isbn), entry, None, f"legacy-{isbn}-{index}")
+    if db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 0:
+        notifications = read_json(LEGACY_NOTIFICATIONS, {})
+        if isinstance(notifications, dict):
+            for account, items in notifications.items():
+                for item in items if isinstance(items, list) else []:
+                    if isinstance(item, dict):
+                        db.execute(
+                            "INSERT OR IGNORE INTO notifications(id,account,title,body,created_at,is_read) VALUES(?,?,?,?,?,?)",
+                            (str(item.get("id", uuid.uuid4().hex)), str(account), str(item.get("title", "通知")), str(item.get("body", "")), str(item.get("date", now_text())), int(bool(item.get("read")))),
+                        )
+    hot = read_json(LEGACY_HOT, {})
+    if isinstance(hot, dict) and db.execute("SELECT COUNT(*) FROM searches").fetchone()[0] == 0:
+        for query in hot.get("hot_searches", []) if isinstance(hot.get("hot_searches", []), list) else []:
+            db.execute("INSERT INTO searches(query,count,last_used) VALUES(?,?,?) ON CONFLICT(query) DO UPDATE SET count=count+1,last_used=excluded.last_used", (str(query), 1, now_text()))
+        for visit_date, count in (hot.get("visit_stats", {}) or {}).items():
+            db.execute("INSERT OR IGNORE INTO visits(visit_date,count) VALUES(?,?)", (str(visit_date), int(count)))
+
+
+def books(include_disabled=False):
+    query = "SELECT * FROM books"
+    if not include_disabled:
+        query += " WHERE enabled=1"
+    query += " ORDER BY name COLLATE NOCASE"
+    with connect_db() as db:
+        return [dict(row) for row in db.execute(query)]
+
+
+def get_book(isbn):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM books WHERE isbn=?", (isbn,)).fetchone()
+        return dict(row) if row else None
 
 
 def search_books(query):
     query = query.strip().lower()
     if not query:
         return []
-    return [
-        (isbn, book)
-        for isbn, book in BOOKS.items()
-        if query in isbn or query in book["name"].lower() or query in book["author"].lower() or query in book["theme"].lower()
-    ]
+    with connect_db() as db:
+        rows = db.execute(
+            "SELECT * FROM books WHERE enabled=1 AND (lower(isbn) LIKE ? OR lower(name) LIKE ? OR lower(author) LIKE ? OR lower(theme) LIKE ?) ORDER BY name",
+            tuple(f"%{query}%" for _ in range(4)),
+        ).fetchall()
+        db.execute("INSERT INTO searches(query,count,last_used) VALUES(?,?,?) ON CONFLICT(query) DO UPDATE SET count=count+1,last_used=excluded.last_used", (query, 1, now_text()))
+        return [dict(row) for row in rows]
 
 
-def open_book(isbn):
-    st.session_state.current_book = isbn
-    st.rerun()
+def comment_rows(isbn):
+    with connect_db() as db:
+        rows = db.execute(
+            """
+            SELECT c.*, COUNT(cl.account) AS likes_count
+            FROM comments c LEFT JOIN comment_likes cl ON cl.comment_id=c.id
+            WHERE c.isbn=? GROUP BY c.id ORDER BY likes_count DESC, c.created_at DESC
+            """,
+            (isbn,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
-def find_comment(entries, comment_id):
-    for comment in entries:
-        if str(comment.get("id")) == str(comment_id):
-            return comment
-        found = find_comment(comment.get("replies", []), comment_id)
-        if found:
-            return found
-    return None
-
-
-def find_comment_path(entries, comment_id, path=None):
-    path = list(path or [])
-    for comment in entries:
-        current_path = path + [comment]
-        if str(comment.get("id")) == str(comment_id):
-            return current_path
-        found = find_comment_path(comment.get("replies", []), comment_id, current_path)
-        if found:
-            return found
-    return None
-
-
-def remove_comment(entries, comment_id):
-    for index, comment in enumerate(entries):
-        if str(comment.get("id")) == str(comment_id):
-            return entries.pop(index)
-        removed = remove_comment(comment.get("replies", []), comment_id)
-        if removed:
-            return removed
-    return None
-
-
-def comment_accounts(comment):
-    accounts = set()
-    account = str(comment.get("user_account", "")).strip()
+def comment_tree(isbn, account=None):
+    rows = comment_rows(isbn)
+    by_parent = {}
+    for row in rows:
+        row["replies"] = []
+        row["liked"] = False
+        by_parent.setdefault(row["parent_id"], []).append(row)
     if account:
-        accounts.add(account)
-    for reply in comment.get("replies", []):
-        accounts.update(comment_accounts(reply))
-    return accounts
+        with connect_db() as db:
+            liked_ids = {row[0] for row in db.execute("SELECT comment_id FROM comment_likes WHERE account=?", (account,))}
+        for row in rows:
+            row["liked"] = row["id"] in liked_ids
+    for row in rows:
+        row["replies"] = by_parent.get(row["id"], [])
+    return by_parent.get(None, [])
 
 
-def can_delete(comment):
+def comment_count(isbn):
+    with connect_db() as db:
+        return db.execute("SELECT COUNT(*) FROM comments WHERE isbn=?", (isbn,)).fetchone()[0]
+
+
+def create_comment(isbn, parent_id, subject, content):
     user = current_user()
-    return bool(user and (is_admin() or comment.get("user_account") == user.get("account")))
-
-
-def notify_users(accounts, title, body):
-    recipients = {str(account).strip() for account in accounts if str(account).strip()}
-    actor = current_user()
-    if actor:
-        recipients.discard(str(actor.get("account", "")).strip())
-    if not recipients:
+    if not user:
         return
-    for account in recipients:
-        notifications = st.session_state.notifications.setdefault(account, [])
-        notifications.insert(0, {
-            "id": uuid.uuid4().hex,
-            "title": title,
-            "body": body,
-            "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "read": False,
-        })
-        st.session_state.notifications[account] = notifications[:100]
-    save_notifications()
+    comment_id = uuid.uuid4().hex
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO comments(id,isbn,parent_id,subject,content,name,user_account,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (comment_id, isbn, parent_id, subject.strip(), content.strip(), user.get("name", user.get("account")), user.get("account"), now_text()),
+        )
+    if parent_id:
+        parent = get_comment(parent_id)
+        if parent:
+            notify_accounts = {parent["user_account"]}
+            notify_users(notify_accounts, "你的留言收到新回复", f"有人回复了你在《{get_book(isbn)['name']}》下的留言。")
 
 
-def delete_comment(isbn, comment_id):
-    entries = st.session_state.messages.get(isbn, [])
-    target = find_comment(entries, comment_id)
-    if not target:
-        st.warning("这条留言已经不存在。")
+def get_comment(comment_id):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM comments WHERE id=?", (comment_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_comment(comment_id):
+    target = get_comment(comment_id)
+    user = current_user()
+    if not target or not user:
         return
-    if not can_delete(target):
+    if not is_admin() and target["user_account"] != user.get("account"):
         st.error("普通用户只能删除自己的留言。")
         return
-    deleted_accounts = comment_accounts(target)
-    subject = str(target.get("subject", "留言"))
-    removed = remove_comment(entries, comment_id)
-    if removed is None:
-        return
-    save_messages()
-    if is_admin():
-        notify_users(
-            deleted_accounts,
-            "你的留言已被管理员删除",
-            f"《{BOOKS.get(isbn, {}).get('name', isbn)}》中的“{subject}”已被管理员删除。",
-        )
-    st.success("留言已删除。")
-    st.rerun()
+    with connect_db() as db:
+        db.execute("DELETE FROM comments WHERE id=?", (comment_id,))
+    if is_admin() and target["user_account"]:
+        notify_users({target["user_account"]}, "你的留言已被管理员删除", f"《{get_book(target['isbn'])['name']}》中的留言已被管理员删除。")
 
 
-def toggle_like(isbn, comment_id):
+def toggle_like(comment_id):
     user = current_user()
     if not user:
         st.info("请先登录后点赞。")
         return
-    target = find_comment(st.session_state.messages.get(isbn, []), comment_id)
-    if not target:
-        return
     account = str(user.get("account"))
-    likes = [str(item) for item in target.get("likes", [])]
-    if account in likes:
-        likes.remove(account)
-    else:
-        likes.append(account)
-    target["likes"] = likes
-    save_messages()
-    st.rerun()
+    with connect_db() as db:
+        exists = db.execute("SELECT 1 FROM comment_likes WHERE comment_id=? AND account=?", (comment_id, account)).fetchone()
+        if exists:
+            db.execute("DELETE FROM comment_likes WHERE comment_id=? AND account=?", (comment_id, account))
+        else:
+            db.execute("INSERT OR IGNORE INTO comment_likes(comment_id,account) VALUES(?,?)", (comment_id, account))
 
 
-def add_reply(isbn, parent_id, content):
-    user = current_user()
-    if not user or not content.strip():
+def notify_users(accounts, title, body):
+    actor = current_user()
+    recipients = {str(account) for account in accounts if account}
+    if actor:
+        recipients.discard(str(actor.get("account")))
+    if not recipients:
         return
-    entries = st.session_state.messages.get(isbn, [])
-    parent = find_comment(entries, parent_id)
-    if not parent:
-        st.error("回复目标不存在。")
+    with connect_db() as db:
+        for account in recipients:
+            db.execute("INSERT INTO notifications(id,account,title,body,created_at,is_read) VALUES(?,?,?,?,?,0)", (uuid.uuid4().hex, account, title, body, now_text()))
+
+
+def notification_rows(account):
+    with connect_db() as db:
+        return [dict(row) for row in db.execute("SELECT * FROM notifications WHERE account=? ORDER BY is_read,created_at DESC", (account,))]
+
+
+def mark_notifications_read(account):
+    with connect_db() as db:
+        db.execute("UPDATE notifications SET is_read=1 WHERE account=?", (account,))
+
+
+def record_visit():
+    if st.session_state.get("visit_recorded"):
         return
-    reply = {
-        "id": uuid.uuid4().hex,
-        "name": user.get("name", user.get("account")),
-        "user_account": user.get("account"),
-        "content": content.strip(),
-        "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "likes": [],
-        "replies": [],
-    }
-    parent.setdefault("replies", []).append(reply)
-    path = find_comment_path(entries, parent_id) or [parent]
-    recipients = {comment.get("user_account") for comment in path if comment.get("user_account")}
-    notify_users(
-        recipients,
-        "你的留言收到新回复",
-        f"有人回复了你在《{BOOKS.get(isbn, {}).get('name', isbn)}》下的留言：“{content.strip()[:80]}”。",
-    )
-    save_messages()
-    st.success("回复已发布。")
-    st.rerun()
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO visits(visit_date,count) VALUES(?,1) ON CONFLICT(visit_date) DO UPDATE SET count=count+1",
+            (dt.date.today().isoformat(),),
+        )
+    st.session_state.visit_recorded = True
 
 
-def show_book_card(isbn, book, count):
-    st.write(f"{book['icon']} **{book['name']}**")
-    st.caption(f"作者：{book['author']} · 主题：{book['theme']} · 留言：{count}")
-    if st.button("查看留言", key=f"book_{isbn}"):
-        open_book(isbn)
+def render_reply(reply, isbn, depth):
+    indent = "　" * min(depth, 8)
+    st.write(f"{indent}↳ @{reply['name']} · 👍 {reply['likes_count']} · {reply['created_at']}")
+    st.write(f"{indent}{reply['content']}")
+    render_comment_actions(reply, isbn, depth)
+    replies = reply.get("replies", [])
+    if replies:
+        key = f"replies_{reply['id']}"
+        expanded = st.session_state.setdefault("expanded_replies", set())
+        if key not in expanded:
+            if st.button(f"{indent}查看回复（{len(replies)}）", key=f"show_{reply['id']}"):
+                expanded.add(key)
+                st.rerun()
+        else:
+            if st.button(f"{indent}收起回复", key=f"hide_{reply['id']}"):
+                expanded.discard(key)
+                st.rerun()
+            limits = st.session_state.setdefault("reply_limits", {})
+            limit = limits.get(key, 5)
+            for child in replies[:limit]:
+                render_reply(child, isbn, depth + 1)
+            if limit < len(replies) and st.button(f"{indent}查看更多回复（还剩 {len(replies) - limit} 条）", key=f"more_{reply['id']}"):
+                limits[key] = limit + 5
+                st.rerun()
 
 
-def comment_likes(comment):
-    return len({str(item) for item in comment.get("likes", [])})
-
-
-def reply_state_key(isbn, comment_id):
-    return f"{isbn}:{comment_id}"
-
-
-def render_replies(comment, isbn, depth):
-    replies = sorted(comment.get("replies", []), key=comment_likes, reverse=True)
-    if not replies:
-        return
-    state_key = reply_state_key(isbn, comment.get("id"))
-    expanded = st.session_state.setdefault("expanded_replies", set())
-    if state_key not in expanded:
-        return
-    limit_state = st.session_state.setdefault("reply_limits", {})
-    limit = limit_state.get(state_key, 5)
-    for index, reply in enumerate(replies[:limit]):
-        render_comment(reply, isbn, index, depth + 1, include_replies=True)
-    if limit < len(replies):
-        remaining = len(replies) - limit
-        if st.button(f"查看更多回复（还剩 {remaining} 条）", key=f"more_replies_{isbn}_{comment.get('id')}"):
-            limit_state[state_key] = limit + 5
-            st.rerun()
-
-
-def render_comment_body(comment, isbn, depth, include_replies):
-    comment_id = str(comment.get("id") or "comment")
-    name = str(comment.get("name", "匿名用户"))
-    content = str(comment.get("content", ""))
-    date = str(comment.get("date", comment.get("timestamp", "")))
-    likes = [str(item) for item in comment.get("likes", [])]
-    state_key = reply_state_key(isbn, comment_id)
-    expanded_replies = st.session_state.setdefault("expanded_replies", set())
-    reply_target = st.session_state.get("reply_target")
-    st.write(content)
-    st.caption(date)
-    action_columns = st.columns([1, 1, 1, 5])
-    liked = current_user() and str(current_user().get("account")) in likes
-    if action_columns[0].button(
-        f"{'取消点赞' if liked else '点赞'}（{comment_likes(comment)}）",
-        key=f"like_{isbn}_{comment_id}",
-    ):
-        toggle_like(isbn, comment_id)
-    if can_delete(comment) and action_columns[1].button("删除", key=f"delete_{isbn}_{comment_id}"):
-        delete_comment(isbn, comment_id)
-    if current_user() and action_columns[2].button("回复", key=f"reply_{isbn}_{comment_id}"):
-        st.session_state.reply_target = (isbn, comment_id)
+def render_comment_actions(comment, isbn, depth=0):
+    columns = st.columns([1, 1, 1, 5])
+    label = "取消点赞" if comment.get("liked") else "点赞"
+    if columns[0].button(f"{label}（{comment['likes_count']}）", key=f"like_{comment['id']}"):
+        toggle_like(comment["id"])
+        st.rerun()
+    if can_delete(comment) and columns[1].button("删除", key=f"delete_{comment['id']}"):
+        delete_comment(comment["id"])
+        st.rerun()
+    if current_user() and columns[2].button("回复", key=f"reply_{comment['id']}"):
+        st.session_state.reply_target = comment["id"]
         st.rerun()
     elif not current_user():
-        action_columns[2].caption("登录后可互动")
-
-    if current_user() and reply_target == (isbn, comment_id):
-        with st.form(f"reply_form_{isbn}_{comment_id}"):
-            reply_content = st.text_area("回复内容", key=f"reply_text_{isbn}_{comment_id}", height=70)
-            reply_submitted = st.form_submit_button("提交回复")
-        if reply_submitted:
-            if reply_content.strip():
-                add_reply(isbn, comment_id, reply_content)
-            else:
+        columns[2].caption("登录后互动")
+    if current_user() and st.session_state.get("reply_target") == comment["id"]:
+        with st.form(f"reply_form_{comment['id']}"):
+            content = st.text_area("回复内容", key=f"reply_text_{comment['id']}", height=70)
+            if st.form_submit_button("提交回复"):
+                if content.strip():
+                    create_comment(isbn, comment["id"], "", content)
+                    st.session_state.reply_target = None
+                    st.rerun()
                 st.warning("回复内容不能为空。")
 
-    reply_count = len(comment.get("replies", []))
-    if reply_count:
-        if state_key in expanded_replies:
-            if st.button("收起回复", key=f"hide_replies_{isbn}_{comment_id}"):
-                expanded_replies.discard(state_key)
-                st.rerun()
-        elif st.button(f"查看回复（{reply_count}）", key=f"show_replies_{isbn}_{comment_id}"):
-            expanded_replies.add(state_key)
-            st.rerun()
-        if include_replies:
-            render_replies(comment, isbn, depth)
 
-
-def render_comment(comment, isbn, index, depth=0, include_replies=True):
-    comment_id = str(comment.get("id", f"comment-{index}"))
-    name = str(comment.get("name", "匿名用户"))
-    subject = comment.get("subject")
-    title = str(subject) if subject else f"回复 @{name}"
-    prefix = "" if depth == 0 else "↳ "
-    state_key = reply_state_key(isbn, comment_id)
-    expanded_replies = st.session_state.setdefault("expanded_replies", set())
-    reply_target = st.session_state.get("reply_target")
-    expander_open = reply_target == (isbn, comment_id) or state_key in expanded_replies
-    if depth == 0:
-        with st.expander(f"{prefix}{title} · @{name} · 👍 {comment_likes(comment)}", expanded=expander_open):
-            render_comment_body(comment, isbn, depth, include_replies)
-    else:
-        st.write(f"↳ {title} · @{name} · 👍 {comment_likes(comment)}")
-        render_comment_body(comment, isbn, depth, include_replies)
+def render_comment(comment, isbn, depth=0):
+    title = comment["subject"] or f"回复 @{comment['name']}"
+    with st.expander(f"{'↳ ' if depth else ''}{title} · @{comment['name']} · 👍 {comment['likes_count']}"):
+        st.write(comment["content"])
+        st.caption(comment["created_at"])
+        render_comment_actions(comment, isbn, depth)
+        replies = comment.get("replies", [])
+        if replies:
+            key = f"replies_{comment['id']}"
+            expanded = st.session_state.setdefault("expanded_replies", set())
+            if key not in expanded:
+                if st.button(f"查看回复（{len(replies)}）", key=f"show_{comment['id']}"):
+                    expanded.add(key)
+                    st.rerun()
+            else:
+                if st.button("收起回复", key=f"hide_{comment['id']}"):
+                    expanded.discard(key)
+                    st.rerun()
+                limits = st.session_state.setdefault("reply_limits", {})
+                limit = limits.get(key, 5)
+                for reply in replies[:limit]:
+                    render_reply(reply, isbn, depth + 1)
+                if limit < len(replies):
+                    if st.button(f"查看更多回复（还剩 {len(replies) - limit} 条）", key=f"more_{comment['id']}"):
+                        limits[key] = limit + 5
+                        st.rerun()
 
 
 def show_book_page(isbn):
-    book = BOOKS[isbn]
-    entries = st.session_state.messages.setdefault(isbn, [])
+    book = get_book(isbn)
+    if not book:
+        st.error("书籍不存在或已被删除。")
+        return
+    account = current_user().get("account") if current_user() else None
+    comments = comment_tree(isbn, account)
     st.header(f"{book['icon']} {book['name']}")
-    st.caption(f"作者：{book['author']}　|　主题：{book['theme']}　|　ISBN：{isbn}")
-    st.subheader(f"💬 留言列表（共 {len(entries)} 条）")
-    if not entries:
-        st.info("暂时没有留言。登录后可以留下第一条留言。")
-    for index, entry in enumerate(sorted(entries, key=comment_likes, reverse=True)):
-        render_comment(entry, isbn, index)
-
-    st.subheader("✒️ 添加留言")
-    if not current_user():
-        st.info("请先在侧边栏注册或登录，再发布留言。")
+    st.caption(f"作者：{book['author']} · 主题：{book['theme']} · ISBN：{isbn}")
+    st.subheader(f"留言（{len(comments)} 条）")
+    if not comments:
+        st.info("暂时没有留言。")
+    for comment in comments:
+        render_comment(comment, isbn)
+    if current_user():
+        with st.form(f"new_comment_{isbn}"):
+            subject = st.text_input("主题")
+            content = st.text_area("留言内容")
+            if st.form_submit_button("提交留言"):
+                if subject.strip() and content.strip():
+                    create_comment(isbn, None, subject, content)
+                    st.rerun()
+                st.warning("主题和留言内容不能为空。")
     else:
-        with st.form(f"message_form_{isbn}"):
-            subject = st.text_input("留言主题 *")
-            content = st.text_area("留言内容 *", height=120)
-            submitted = st.form_submit_button("提交留言", type="primary")
-        if submitted:
-            if not subject.strip() or not content.strip():
-                st.error("请填写留言主题和留言内容。")
-            else:
-                user = current_user()
-                entries.append({
-                    "id": uuid.uuid4().hex,
-                    "subject": subject.strip(),
-                    "name": user.get("name", user.get("account")),
-                    "user_account": user.get("account"),
-                    "content": content.strip(),
-                    "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "likes": [],
-                    "replies": [],
-                })
-                save_messages()
-                st.success("留言添加成功！")
-                st.rerun()
-    if st.button("↩ 返回首页", key=f"home_{isbn}"):
+        st.info("登录后可以发布留言、点赞和回复。")
+    if st.button("返回首页", key=f"home_{isbn}"):
         st.session_state.current_book = None
         st.rerun()
 
@@ -508,183 +481,200 @@ def show_book_page(isbn):
 def show_my_messages():
     user = current_user()
     if not user:
-        st.info("请先登录后查看我的留言。")
+        st.info("请先登录。")
         return
-    st.header("📝 我的留言")
-    mine = sorted(
-        [comment for comment in all_comments() if comment.get("user_account") == user.get("account")],
-        key=comment_likes,
-        reverse=True,
-    )
-    if not mine:
+    with connect_db() as db:
+        rows = [dict(row) for row in db.execute("SELECT c.*, COUNT(cl.account) likes_count FROM comments c LEFT JOIN comment_likes cl ON cl.comment_id=c.id WHERE c.user_account=? GROUP BY c.id ORDER BY likes_count DESC, c.created_at DESC", (user["account"],))]
+    st.header("我的留言")
+    if not rows:
         st.info("你还没有留言。")
-        return
-    for index, comment in enumerate(mine):
-        st.markdown(f"#### {comment['book']} · {comment.get('subject', '回复')}")
-        render_comment(comment, comment["isbn"], index, depth=0, include_replies=False)
+    for row in rows:
+        st.write(f"{row['subject'] or '回复'} · {row['created_at']} · 👍 {row['likes_count']}")
+        st.write(row["content"])
 
 
 def show_notifications():
     user = current_user()
     if not user:
-        st.info("请先登录后查看通知。")
+        st.info("请先登录。")
         return
-    account = str(user.get("account"))
-    notifications = st.session_state.notifications.setdefault(account, [])
-    st.header("🔔 通知")
-    if not notifications:
-        st.info("暂无通知。")
-        return
-    if st.button("全部标记为已读", key="mark_all_notifications"):
-        for notification in notifications:
-            notification["read"] = True
-        save_notifications()
+    rows = notification_rows(user["account"])
+    st.header("通知")
+    if st.button("全部标记为已读"):
+        mark_notifications_read(user["account"])
         st.rerun()
-    for notification in notifications:
-        prefix = "未读 · " if not notification.get("read") else ""
-        st.info(f"{prefix}{notification.get('title', '通知')}\n\n{notification.get('body', '')}\n\n{notification.get('date', '')}")
+    if not rows:
+        st.info("暂无通知。")
+    for row in rows:
+        st.write(f"{'未读 · ' if not row['is_read'] else ''}{row['title']} · {row['created_at']}")
+        st.info(row["body"])
+
+
+def show_book_admin():
+    if not is_admin():
+        st.error("只有管理员可以管理书籍。")
+        return
+    st.header("书籍管理")
+    all_books = books(include_disabled=True)
+    with st.form("add_book"):
+        st.subheader("添加书籍")
+        isbn = st.text_input("ISBN")
+        name = st.text_input("书名")
+        author = st.text_input("作者")
+        theme = st.text_input("主题")
+        icon = st.text_input("图标", value="📚")
+        if st.form_submit_button("添加"):
+            if not isbn.strip() or not name.strip():
+                st.error("ISBN 和书名不能为空。")
+            else:
+                try:
+                    with connect_db() as db:
+                        db.execute("INSERT INTO books(isbn,name,author,theme,icon,enabled,created_at) VALUES(?,?,?,?,?,1,?)", (isbn.strip(), name.strip(), author.strip(), theme.strip(), icon.strip() or "📚", now_text()))
+                    st.success("书籍已添加。")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("该 ISBN 已存在。")
+    if all_books:
+        selected = st.selectbox("选择要编辑的书籍", [book["isbn"] for book in all_books])
+        book = next(book for book in all_books if book["isbn"] == selected)
+        with st.form(f"edit_book_{selected}"):
+            name = st.text_input("书名", value=book["name"])
+            author = st.text_input("作者", value=book["author"])
+            theme = st.text_input("主题", value=book["theme"])
+            icon = st.text_input("图标", value=book["icon"])
+            enabled = st.checkbox("启用", value=bool(book["enabled"]))
+            if st.form_submit_button("保存修改"):
+                with connect_db() as db:
+                    db.execute("UPDATE books SET name=?,author=?,theme=?,icon=?,enabled=? WHERE isbn=?", (name.strip(), author.strip(), theme.strip(), icon.strip() or "📚", int(enabled), selected))
+                st.success("书籍已更新。")
+                st.rerun()
+        if comment_count(selected) == 0 and st.button("删除该书籍", key=f"remove_book_{selected}"):
+            with connect_db() as db:
+                db.execute("DELETE FROM books WHERE isbn=?", (selected,))
+            st.success("书籍已删除。")
+            st.rerun()
+        elif comment_count(selected):
+            st.caption("该书已有留言，不能删除；可以停用。")
 
 
 def account_panel():
     user = current_user()
     if user:
-        account = str(user.get("account"))
-        unread = sum(1 for item in st.session_state.notifications.get(account, []) if not item.get("read"))
-        st.sidebar.success(f"已登录：{user.get('name', account)}{'（管理员）' if is_admin() else ''}")
-        if st.sidebar.button(f"🔔 通知 ({unread})", use_container_width=True):
+        unread = len([row for row in notification_rows(user["account"]) if not row["is_read"]])
+        st.sidebar.write(f"已登录：{user['name']}{'（管理员）' if is_admin() else ''}")
+        if st.sidebar.button(f"通知（{unread}）"):
             st.session_state.page = "通知"
-            st.session_state.current_book = None
             st.rerun()
-        if st.sidebar.button("退出登录", use_container_width=True):
+        if is_admin() and st.sidebar.button("书籍管理"):
+            st.session_state.page = "书籍管理"
+            st.rerun()
+        if st.sidebar.button("我的留言"):
+            st.session_state.page = "我的留言"
+            st.rerun()
+        if st.sidebar.button("退出登录"):
             st.session_state.user = None
             st.session_state.page = "首页"
             st.rerun()
         return
-
     mode = st.sidebar.radio("账户", ["登录", "注册"], horizontal=True)
     if mode == "注册":
-        with st.sidebar.form("register_form"):
+        with st.sidebar.form("register"):
             account = st.text_input("账号")
             name = st.text_input("昵称")
             password = st.text_input("密码", type="password")
             confirm = st.text_input("确认密码", type="password")
-            submitted = st.form_submit_button("注册", use_container_width=True)
-        if submitted:
+            submit = st.form_submit_button("注册")
+        if submit:
             if not account.strip() or not password:
                 st.sidebar.error("账号和密码不能为空。")
-            elif is_reserved_admin_account(account.strip()):
+            elif account.strip() == ADMIN_ACCOUNT or account.strip() in admin_accounts_from_secrets():
                 st.sidebar.error("管理员账号不能注册为普通用户。")
-            elif account.strip() in st.session_state.users:
-                st.sidebar.error("该账号已存在。")
             elif password != confirm:
-                st.sidebar.error("两次输入的密码不一致。")
+                st.sidebar.error("两次密码不一致。")
             else:
-                st.session_state.users[account.strip()] = {"name": name.strip() or account.strip(), "password": password_hash(password)}
-                save_users()
-                st.sidebar.success("注册成功，请登录。")
+                try:
+                    with connect_db() as db:
+                        db.execute("INSERT INTO users(account,name,password_hash,created_at) VALUES(?,?,?,?)", (account.strip(), name.strip() or account.strip(), password_hash(password), now_text()))
+                    st.sidebar.success("注册成功，请登录。")
+                except sqlite3.IntegrityError:
+                    st.sidebar.error("该账号已存在。")
     else:
-        with st.sidebar.form("login_form"):
+        with st.sidebar.form("login"):
             account = st.text_input("账号")
             password = st.text_input("密码", type="password")
-            submitted = st.form_submit_button("登录", use_container_width=True)
-        if submitted:
+            submit = st.form_submit_button("登录")
+        if submit:
             account = account.strip()
             admin = admin_accounts_from_secrets().get(account)
-            if admin:
-                if password == admin["password"]:
-                    st.session_state.user = {"account": account, "name": admin["name"], "role": "admin"}
-                    st.session_state.page = "首页"
-                    st.rerun()
-                st.sidebar.error("管理员密码不正确，或未在 Streamlit Secrets 中配置。")
-            else:
-                saved = st.session_state.users.get(account)
-                if saved and saved.get("password") == password_hash(password):
-                    st.session_state.user = {"account": account, "name": saved.get("name", account), "role": "user"}
-                    st.session_state.page = "首页"
-                    st.rerun()
-                st.sidebar.error("账号或密码错误。")
+            if admin and password == admin["password"]:
+                st.session_state.user = {"account": account, "name": admin["name"], "role": "admin"}
+                st.rerun()
+            with connect_db() as db:
+                user = db.execute("SELECT * FROM users WHERE account=?", (account,)).fetchone()
+            if user and user["password_hash"] == password_hash(password):
+                st.session_state.user = {"account": account, "name": user["name"], "role": "user"}
+                st.rerun()
+            st.sidebar.error("账号或密码错误。")
 
 
-for key, loader in (
-    ("messages", load_messages),
-    ("users", load_users),
-    ("notifications", load_notifications),
-    ("hot_data", load_hot_data),
-):
-    if key not in st.session_state:
-        st.session_state[key] = loader()
-if "current_book" not in st.session_state:
-    st.session_state.current_book = None
+init_db()
+if "user" not in st.session_state:
+    st.session_state.user = None
 if "page" not in st.session_state:
     st.session_state.page = "首页"
+if "current_book" not in st.session_state:
+    st.session_state.current_book = None
+if "expanded_replies" not in st.session_state:
+    st.session_state.expanded_replies = set()
+if "reply_limits" not in st.session_state:
+    st.session_state.reply_limits = {}
+record_visit()
 
 
 with st.sidebar:
-    st.header("🔐 账户与检索")
+    st.header("账户")
     account_panel()
     st.divider()
-    if current_user() and st.button("我的留言", use_container_width=True):
-        st.session_state.page = "我的留言"
-        st.session_state.current_book = None
-        st.rerun()
-    with st.form("search_form"):
-        query = st.text_input("书名、作者或 ISBN")
-        submitted = st.form_submit_button("检索书籍", use_container_width=True)
-    if submitted:
-        st.session_state.search_query = query.strip()
-        st.session_state.search_results = search_books(query)
-        if query.strip():
-            searches = st.session_state.hot_data.setdefault("hot_searches", [])
-            searches.append(query.strip())
-            st.session_state.hot_data["hot_searches"] = searches[-20:]
-            save_hot_data()
-    uploaded = st.file_uploader("📷 上传旧照片", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        st.image(uploaded, caption="已加载的历史影像", use_container_width=True)
+    with st.form("search"):
+        query = st.text_input("搜索书名、作者或 ISBN")
+        if st.form_submit_button("搜索"):
+            st.session_state.search_results = search_books(query)
+            st.session_state.search_query = query.strip()
+    st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
-st.title("📜 图书馆跨时空留言板")
-st.markdown("留下你的阅读疑问，也可以回应其他读者的思考。")
-
-if st.session_state.get("current_book"):
+st.title("图书馆跨时空留言板")
+page = st.session_state.page
+if st.session_state.current_book:
     show_book_page(st.session_state.current_book)
-elif st.session_state.get("page") == "我的留言":
+elif page == "我的留言":
     show_my_messages()
-elif st.session_state.get("page") == "通知":
+elif page == "通知":
     show_notifications()
+elif page == "书籍管理":
+    show_book_admin()
 else:
-    messages = all_messages()
+    results = st.session_state.get("search_results", [])
     if st.session_state.get("search_query"):
-        st.subheader(f"🔎 检索结果：{st.session_state.search_query}")
-        results = st.session_state.get("search_results", [])
+        st.subheader(f"搜索结果：{st.session_state.search_query}")
+        for book in results:
+            if st.button(f"{book['icon']} {book['name']} · {book['isbn']}", key=f"result_{book['isbn']}"):
+                open_book(book["isbn"])
         if not results:
             st.info("没有找到相关书籍。")
-        for index, (isbn, book) in enumerate(results):
-            st.write(f"{book['icon']} **{book['name']}**　作者：{book['author']}　ISBN：{isbn}")
-            if st.button("进入书页", key=f"result_{isbn}_{index}"):
-                open_book(isbn)
-
-    st.subheader("🔥 热点书籍")
-    counts = Counter(message["isbn"] for message in messages)
+    st.subheader("书籍")
+    visible_books = books()
     cols = st.columns(3)
-    for index, (isbn, book) in enumerate(BOOKS.items()):
+    for index, book in enumerate(visible_books):
         with cols[index % 3]:
-            show_book_card(isbn, book, counts.get(isbn, 0))
-
-    st.subheader("💬 热门讨论")
-    discussions = st.session_state.hot_data.get("hot_discussions", [])
-    st.info("暂无热门讨论。" if not discussions else "热门讨论数据已加载。")
-    if discussions:
-        for item in discussions:
-            st.write(item)
-
-    st.subheader("🔎 热门搜索")
-    searches = st.session_state.hot_data.get("hot_searches", [])
-    st.info("暂无热门搜索。" if not searches else "、".join(searches))
-
-    st.subheader("📊 访问统计")
-    stats = st.session_state.hot_data.get("visit_stats", {})
-    st.info("暂无访问统计。" if not stats else str(stats))
-
-    st.subheader("🕰️ 历史回响")
-    st.info("暂时没有留言。" if not messages else f"当前共有 {len(messages)} 条留言。")
+            st.write(f"{book['icon']} **{book['name']}**")
+            st.caption(f"{book['author']} · {book['theme']} · 留言 {comment_count(book['isbn'])}")
+            if st.button("查看留言", key=f"book_{book['isbn']}"):
+                open_book(book["isbn"])
+    st.subheader("热门搜索")
+    with connect_db() as db:
+        hot_searches = [row[0] for row in db.execute("SELECT query FROM searches ORDER BY count DESC, last_used DESC LIMIT 10")]
+        stats = db.execute("SELECT COALESCE(SUM(count),0) FROM visits").fetchone()[0]
+    st.info("暂无热门搜索。" if not hot_searches else "、".join(hot_searches))
+    st.subheader("访问统计")
+    st.info("暂无访问统计。" if not stats else f"累计访问：{stats}")
