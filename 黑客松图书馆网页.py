@@ -4,6 +4,9 @@ import json
 import sqlite3
 import uuid
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
@@ -24,6 +27,72 @@ def now_text():
 
 def password_hash(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def fetch_json(url):
+    request = Request(
+        url,
+        headers={"User-Agent": "LibraryHackathon/1.0"}
+    )
+    with urlopen(request, timeout=8) as response:
+        return json.loads(response.read().decode("utf-8"))
+@st.cache_data(ttl=86400, show_spinner=False)
+def lookup_open_library(query):
+    query = query.strip()
+    if not query:
+        return []
+
+    clean_query = query.replace("-", "").replace(" ", "")
+
+    if clean_query.isdigit():
+        url = (
+            "https://openlibrary.org/search.json"
+            f"?isbn={quote(clean_query)}&limit=10"
+        )
+    else:
+        url = (
+            "https://openlibrary.org/search.json"
+            f"?q={quote(query)}&limit=10"
+        )
+
+    try:
+        data = fetch_json(url)
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ):
+        return []
+
+    results = []
+
+    for item in data.get("docs", []):
+        isbn_list = item.get("isbn", [])
+
+        isbn = next(
+            (
+                value.replace("-", "").replace(" ", "")
+                for value in isbn_list
+                if len(value.replace("-", "").replace(" ", "")) == 13
+                and value.replace("-", "").replace(" ", "").isdigit()
+            ),
+            None,
+        )
+
+        if not isbn:
+            continue
+
+        authors = item.get("author_name", [])
+        subjects = item.get("subject", [])
+
+        results.append({
+            "isbn": isbn,
+            "name": item.get("title", "未知书名"),
+            "author": "、".join(authors[:3]) or "未知作者",
+            "theme": "、".join(subjects[:3]) or "未分类",
+            "icon": "📚",
+        })
+
+    return results
 
 
 def admin_accounts_from_secrets():
@@ -229,6 +298,36 @@ def books(include_disabled=False):
     query += " ORDER BY name COLLATE NOCASE"
     with connect_db() as db:
         return [dict(row) for row in db.execute(query)]
+def save_remote_book(book):
+    with connect_db() as db:
+        db.execute(
+            """
+            INSERT INTO books(
+                isbn,
+                name,
+                author,
+                theme,
+                icon,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(isbn) DO UPDATE SET
+                name = excluded.name,
+                author = excluded.author,
+                theme = excluded.theme,
+                icon = excluded.icon,
+                enabled = 1
+            """,
+            (
+                book["isbn"],
+                book["name"],
+                book["author"],
+                book["theme"],
+                book["icon"],
+                now_text(),
+            ),
+        )
 
 
 def get_book(isbn):
@@ -628,6 +727,12 @@ if "expanded_replies" not in st.session_state:
     st.session_state.expanded_replies = set()
 if "reply_limits" not in st.session_state:
     st.session_state.reply_limits = {}
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
+if "remote_results" not in st.session_state:
+    st.session_state.remote_results = []
+if "search_query" not in st.session_state:
+    st.session_state.search_query = ""
 record_visit()
 
 
@@ -637,9 +742,16 @@ with st.sidebar:
     st.divider()
     with st.form("search"):
         query = st.text_input("搜索书名、作者或 ISBN")
+
         if st.form_submit_button("搜索"):
+            query = query.strip()
+
+            st.session_state.search_query = query
             st.session_state.search_results = search_books(query)
-            st.session_state.search_query = query.strip()
+            st.session_state.remote_results = []
+
+            if query and not st.session_state.search_results:
+                st.session_state.remote_results = lookup_open_library(query)
     st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
@@ -660,8 +772,33 @@ else:
         for book in results:
             if st.button(f"{book['icon']} {book['name']} · {book['isbn']}", key=f"result_{book['isbn']}"):
                 open_book(book["isbn"])
-        if not results:
-            st.info("没有找到相关书籍。")
+    remote_results = st.session_state.get("remote_results", [])
+
+    if remote_results:
+        st.subheader("在线书籍")
+
+        for book in remote_results:
+            st.write(
+                f"{book['icon']} **{book['name']}**"
+                f" · {book['author']}"
+                f" · ISBN：{book['isbn']}"
+            )
+
+            if is_admin():
+                if st.button(
+                        "导入到书库",
+                        key=f"import_{book['isbn']}"
+                ):
+                    save_remote_book(book)
+                    st.session_state.remote_results = []
+                    st.success("书籍已自动导入到书库。")
+                    st.rerun()
+            else:
+                st.caption("只有管理员可以导入书籍。")
+
+    if st.session_state.get("search_query") and not results and not remote_results:
+        st.info("本地书库和在线书籍资料库都没有找到相关书籍，或在线服务暂时不可用。")
+
     st.subheader("书籍")
     visible_books = books()
     cols = st.columns(3)
