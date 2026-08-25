@@ -228,6 +228,64 @@ def lookup_crossref_journals(query):
     return results
 
 
+@st.cache_data(ttl=1800, max_entries=100, show_spinner=False)
+def lookup_crossref_journal_issues(journal_identifier):
+    """获取 Crossref 收录的期刊期次，并按卷号、期号和出版日期归并。"""
+    issn = normalize_issn(str(journal_identifier).replace("ISSN:", ""))
+    if not issn:
+        return []
+    url = (
+        f"https://api.crossref.org/journals/{quote(issn)}/works"
+        "?filter=type:journal-article&rows=1000"
+        "&select=title,volume,issue,published,container-title,URL"
+        "&sort=published&order=desc"
+    )
+    try:
+        items = fetch_json(url, timeout=20).get("message", {}).get("items", [])
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    grouped = {}
+    for item in items:
+        volume = str(item.get("volume", "")).strip()
+        issue = str(item.get("issue", "")).strip()
+        dates = item.get("published", {}).get("date-parts", [])
+        date_parts = dates[0] if dates and isinstance(dates[0], list) else []
+        year = str(date_parts[0]) if date_parts else ""
+        month = str(date_parts[1]).zfill(2) if len(date_parts) > 1 else ""
+        day = str(date_parts[2]).zfill(2) if len(date_parts) > 2 else ""
+        published = "-".join(part for part in (year, month, day) if part)
+        if not (volume or issue or published):
+            continue
+        key = "|".join((volume, issue, published[:7] if not issue else ""))
+        if key in grouped:
+            continue
+        container_titles = item.get("container-title", [])
+        journal_name = container_titles[0] if container_titles else "期刊"
+        label_parts = []
+        if volume:
+            label_parts.append(f"卷 {volume}")
+        if issue:
+            label_parts.append(f"期 {issue}")
+        if published:
+            label_parts.append(published)
+        label = " · ".join(label_parts) or "未知期次"
+        issue_id = f"ISSUE:{issn}:{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+        grouped[key] = {
+            "isbn": issue_id,
+            "name": f"{journal_name} · {label}",
+            "author": "未知出版机构",
+            "theme": f"{label}（Crossref 收录期次）",
+            "icon": "📰",
+            "item_type": "journal_issue",
+            "identifier_type": "期次",
+            "parent_isbn": f"ISSN:{issn}",
+            "issue_label": label,
+            "published_at": published,
+            "url": str(item.get("URL", "")).strip(),
+        }
+    return list(grouped.values())
+
+
 def wikidata_author_from_description(description):
     for pattern in (
         r"作者[：:为是]?\s*([^，。,；;]+)",
@@ -506,6 +564,9 @@ def init_db():
                 icon TEXT NOT NULL DEFAULT '📚',
                 item_type TEXT NOT NULL DEFAULT 'book',
                 identifier_type TEXT NOT NULL DEFAULT 'ISBN',
+                parent_isbn TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
@@ -571,6 +632,9 @@ def init_db():
         )
         ensure_column(db, "books", "item_type", "TEXT NOT NULL DEFAULT 'book'")
         ensure_column(db, "books", "identifier_type", "TEXT NOT NULL DEFAULT 'ISBN'")
+        ensure_column(db, "books", "parent_isbn", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "published_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "source_url", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "book_requests", "item_type", "TEXT NOT NULL DEFAULT 'book'")
         ensure_column(db, "book_requests", "identifier_type", "TEXT NOT NULL DEFAULT 'ISBN'")
         migrate_legacy_data(db)
@@ -649,10 +713,13 @@ def migrate_legacy_data(db):
             db.execute("INSERT OR IGNORE INTO visits(visit_date,count) VALUES(?,?)", (str(visit_date), int(count)))
 
 
-def books(include_disabled=False):
+def books(include_disabled=False, include_issues=False):
     query = "SELECT * FROM books"
     if not include_disabled:
         query += " WHERE enabled=1"
+    if not include_issues:
+        query += " AND" if " WHERE " in query else " WHERE"
+        query += " item_type != 'journal_issue'"
     query += " ORDER BY name COLLATE NOCASE"
     with connect_db() as db:
         return [dict(row) for row in db.execute(query)]
@@ -671,7 +738,7 @@ def popular_books(limit=6):
                     JOIN comments c ON c.id=cl.comment_id
                     WHERE c.isbn=b.isbn) AS likes_count
             FROM books b
-            WHERE b.enabled=1
+            WHERE b.enabled=1 AND b.item_type != 'journal_issue'
             ORDER BY comments_count DESC, likes_count DESC, b.name COLLATE NOCASE
             LIMIT ?
             """,
@@ -681,11 +748,63 @@ def popular_books(limit=6):
 
 
 def item_type_label(item):
-    return "期刊" if item.get("item_type") == "journal" else "书籍"
+    if item.get("item_type") == "journal":
+        return "期刊"
+    if item.get("item_type") == "journal_issue":
+        return "期次"
+    return "书籍"
 
 
 def item_creator_label(item):
-    return "出版机构" if item.get("item_type") == "journal" else "作者"
+    return "出版机构" if item.get("item_type") in ("journal", "journal_issue") else "作者"
+
+
+def open_catalog_item(item):
+    if item.get("item_type") == "journal":
+        st.session_state.current_journal = item
+        st.session_state.page = "期刊期次"
+        st.session_state.current_book = None
+        st.rerun()
+    open_book(item["isbn"])
+
+
+def journal_issue_rows(parent_isbn):
+    with connect_db() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM books
+            WHERE enabled=1 AND item_type='journal_issue' AND parent_isbn=?
+            ORDER BY published_at DESC, name COLLATE NOCASE
+            """,
+            (parent_isbn,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def save_journal_issues(journal, issues):
+    with connect_db() as db:
+        for issue in issues:
+            db.execute(
+                """
+                INSERT INTO books(
+                    isbn,name,author,theme,icon,item_type,identifier_type,
+                    parent_isbn,published_at,source_url,enabled,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)
+                ON CONFLICT(isbn) DO UPDATE SET
+                    name=excluded.name,author=excluded.author,theme=excluded.theme,
+                    icon=excluded.icon,item_type=excluded.item_type,
+                    identifier_type=excluded.identifier_type,
+                    parent_isbn=excluded.parent_isbn,published_at=excluded.published_at,
+                    source_url=excluded.source_url,enabled=1
+                """,
+                (
+                    issue["isbn"], issue["name"], issue["author"], issue["theme"],
+                    issue["icon"], issue.get("item_type", "journal_issue"),
+                    issue.get("identifier_type", "期次"), issue.get("parent_isbn", journal["isbn"]),
+                    issue.get("published_at", ""), issue.get("url", ""),
+                    now_text(),
+                ),
+            )
 
 
 def item_identifier(item):
@@ -696,6 +815,8 @@ def item_identifier(item):
 
 
 def item_identifier_text(item):
+    if item.get("item_type") == "journal_issue":
+        return f"期次标识：{item_identifier(item)}"
     identifier_type = item.get("identifier_type") or (
         "ISSN" if str(item.get("isbn", item.get("book_id", ""))).startswith("ISSN:") else "ISBN"
     )
@@ -714,10 +835,11 @@ def save_remote_book(book):
                 icon,
                 item_type,
                 identifier_type,
+                parent_isbn,
                 enabled,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(isbn) DO UPDATE SET
                 name = excluded.name,
                 author = excluded.author,
@@ -725,6 +847,7 @@ def save_remote_book(book):
                 icon = excluded.icon,
                 item_type = excluded.item_type,
                 identifier_type = excluded.identifier_type,
+                parent_isbn = excluded.parent_isbn,
                 enabled = 1
             """,
             (
@@ -735,6 +858,7 @@ def save_remote_book(book):
                 book["icon"],
                 book.get("item_type", "book"),
                 book.get("identifier_type", "ISBN"),
+                book.get("parent_isbn", ""),
                 now_text(),
             ),
         )
@@ -899,7 +1023,7 @@ def search_books(query):
         return []
     with connect_db() as db:
         rows = db.execute(
-            "SELECT * FROM books WHERE enabled=1 AND (lower(isbn) LIKE ? OR lower(name) LIKE ? OR lower(author) LIKE ? OR lower(theme) LIKE ?) ORDER BY name",
+            "SELECT * FROM books WHERE enabled=1 AND item_type != 'journal_issue' AND (lower(isbn) LIKE ? OR lower(name) LIKE ? OR lower(author) LIKE ? OR lower(theme) LIKE ?) ORDER BY name",
             tuple(f"%{query}%" for _ in range(4)),
         ).fetchall()
         db.execute("INSERT INTO searches(query,count,last_used) VALUES(?,?,?) ON CONFLICT(query) DO UPDATE SET count=count+1,last_used=excluded.last_used", (query, 1, now_text()))
@@ -920,6 +1044,7 @@ def back_home_button(key):
     if st.button("返回首页", key=key):
         st.session_state.page = "首页"
         st.session_state.current_book = None
+        st.session_state.current_journal = None
         st.session_state.search_query = ""
         st.session_state.search_results = []
         st.session_state.remote_results = []
@@ -1293,7 +1418,41 @@ def show_all_books():
                 f"留言 {comment_count(book['isbn'])}"
             )
             if st.button("查看留言", key=f"all_book_{book['isbn']}"):
-                open_book(book["isbn"])
+                open_catalog_item(book)
+
+
+def show_journal_issues():
+    journal = st.session_state.get("current_journal") or {}
+    back_home_button("home_from_journal_issues")
+    if not journal:
+        st.info("没有选择期刊。")
+        return
+    st.header(f"{journal.get('icon', '📰')} {journal.get('name', '期刊')}：所有期次")
+    st.caption(
+        f"出版机构：{journal.get('author', '未知出版机构')} · "
+        f"{item_identifier_text(journal)}"
+    )
+    if journal.get("item_type") != "journal":
+        st.error("当前对象不是期刊。")
+        return
+    issues = journal_issue_rows(journal["isbn"])
+    if not issues:
+        with st.spinner("正在从 Crossref 获取期次……"):
+            issues = lookup_crossref_journal_issues(journal["isbn"])
+            if issues:
+                save_journal_issues(journal, issues)
+                issues = journal_issue_rows(journal["isbn"])
+    if not issues:
+        st.info("暂时没有获取到该期刊的期次。部分期刊可能未将卷期信息完整登记到 Crossref。")
+        return
+    st.caption(f"共显示 {len(issues)} 个 Crossref 收录期次；每个期次都有独立留言区。")
+    for issue in issues:
+        st.write(f"{issue['icon']} **{issue['name']}**")
+        st.caption(f"{item_identifier_text(issue)} · 留言 {comment_count(issue['isbn'])}")
+        if issue.get("url"):
+            st.caption(issue["url"])
+        if st.button("查看本期期次留言", key=f"issue_{issue['isbn']}"):
+            open_book(issue["isbn"])
 
 
 def show_book_requests_admin():
@@ -1400,6 +1559,8 @@ if "page" not in st.session_state:
     st.session_state.page = "首页"
 if "current_book" not in st.session_state:
     st.session_state.current_book = None
+if "current_journal" not in st.session_state:
+    st.session_state.current_journal = None
 if "expanded_replies" not in st.session_state:
     st.session_state.expanded_replies = set()
 if "reply_limits" not in st.session_state:
@@ -1439,6 +1600,7 @@ with st.sidebar:
             st.session_state.remote_results = []
             st.session_state.page = "首页"
             st.session_state.current_book = None
+            st.session_state.current_journal = None
 
             if query:
                 if search_kind == "journal":
@@ -1474,6 +1636,8 @@ elif page == "书刊申请":
     show_book_requests_admin()
 elif page == "全部书刊":
     show_all_books()
+elif page == "期刊期次":
+    show_journal_issues()
 else:
     results = st.session_state.get("search_results", [])
     if st.session_state.get("search_query"):
@@ -1484,7 +1648,7 @@ else:
                 f"{item_identifier_text(book)}",
                 key=f"result_{book['isbn']}",
             ):
-                open_book(book["isbn"])
+                open_catalog_item(book)
     remote_results = st.session_state.get("remote_results", [])
 
     if remote_results:
@@ -1497,6 +1661,14 @@ else:
                 f" · {item_creator_label(book)}：{book['author']}"
                 f" · {item_identifier_text(book)}"
             )
+
+            if book.get("item_type") == "journal" and st.button(
+                "查看所有期次", key=f"issues_{book['isbn']}"
+            ):
+                st.session_state.current_journal = book
+                st.session_state.page = "期刊期次"
+                st.session_state.current_book = None
+                st.rerun()
 
             if is_admin():
                 if st.button(
@@ -1536,8 +1708,9 @@ else:
                 f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
                 f"留言 {comment_count(book['isbn'])}"
             )
-            if st.button("查看留言", key=f"book_{book['isbn']}"):
-                open_book(book["isbn"])
+            button_label = "查看所有期次" if book.get("item_type") == "journal" else "查看留言"
+            if st.button(button_label, key=f"book_{book['isbn']}"):
+                open_catalog_item(book)
     if st.button("查看全部书刊"):
         st.session_state.page = "全部书刊"
         st.session_state.current_book = None
