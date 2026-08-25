@@ -28,14 +28,14 @@ def now_text():
 
 def password_hash(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
-def fetch_json(url):
+def fetch_json(url, timeout=8):
     request = Request(
         url,
         headers={"User-Agent": "LibraryHackathon/1.0"}
     )
-    with urlopen(request, timeout=8) as response:
+    with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=600, max_entries=100, show_spinner=False)
 def lookup_open_library(query):
     query = query.strip()
     if not query:
@@ -46,12 +46,12 @@ def lookup_open_library(query):
     if clean_query.isdigit():
         url = (
             "https://openlibrary.org/search.json"
-            f"?isbn={quote(clean_query)}&limit=10"
+            f"?isbn={quote(clean_query)}&limit=40"
         )
     else:
         url = (
             "https://openlibrary.org/search.json"
-            f"?q={quote(query)}&limit=10"
+            f"?q={quote(query)}&language=chi&limit=40"
         )
 
     try:
@@ -98,106 +98,329 @@ def lookup_open_library(query):
             "author": "、".join(authors[:3]) or "未知作者",
             "theme": "、".join(subjects[:3]) or "未分类",
             "icon": "📚",
+            "item_type": "book",
+            "identifier_type": "Open Library ID" if isbn.startswith("OL:") else "ISBN",
         })
 
     return results
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=600, max_entries=100, show_spinner=False)
 def lookup_google_books(query):
     query = query.strip()
     if not query:
         return []
 
-    url = (
-        "https://www.googleapis.com/books/v1/volumes"
-        f"?q={quote(query)}&maxResults=10&printType=books"
-    )
-
-    try:
-        data = fetch_json(url)
-    except (
-        HTTPError,
-        URLError,
-        TimeoutError,
-        json.JSONDecodeError,
-    ):
-        return []
-
     results = []
     seen = set()
-    for item in data.get("items", []):
-        info = item.get("volumeInfo", {})
-        identifiers = info.get("industryIdentifiers", [])
-        isbn = next(
-            (
-                str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")
-                for identifier in identifiers
-                if len(str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")) in (10, 13)
-            ),
-            None,
+    search_terms = [query, f"intitle:{query}", f"inauthor:{query}"]
+    for search_term in search_terms:
+        url = (
+            "https://www.googleapis.com/books/v1/volumes"
+            f"?q={quote(search_term)}&langRestrict=zh&maxResults=40&printType=books"
         )
-        if not isbn:
-            # 没有 ISBN 时使用 Google Books volume ID，仍可保存到本地书库。
-            volume_id = str(item.get("id", "")).strip()
-            if volume_id:
-                isbn = "GB:" + volume_id
-        if not isbn or isbn in seen:
+        try:
+            data = fetch_json(url)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             continue
-        seen.add(isbn)
-        results.append({
-            "isbn": isbn,
-            "name": info.get("title", "未知书名"),
-            "author": "、".join(info.get("authors", [])[:3]) or "未知作者",
-            "theme": "、".join(info.get("categories", [])[:3]) or "未分类",
-            "icon": "📚",
-        })
+
+        for item in data.get("items", []):
+            info = item.get("volumeInfo", {})
+            identifiers = info.get("industryIdentifiers", [])
+            isbn = next(
+                (
+                    str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")
+                    for identifier in identifiers
+                    if len(str(identifier.get("identifier", "")).replace("-", "").replace(" ", "")) in (10, 13)
+                ),
+                None,
+            )
+            if not isbn:
+                volume_id = str(item.get("id", "")).strip()
+                if volume_id:
+                    isbn = "GB:" + volume_id
+            if not isbn or isbn in seen:
+                continue
+            seen.add(isbn)
+            results.append({
+                "isbn": isbn,
+                "name": info.get("title", "未知书名"),
+                "author": "、".join(info.get("authors", [])[:3]) or "未知作者",
+                "theme": "、".join(info.get("categories", [])[:3]) or "未分类",
+                "icon": "📚",
+                "item_type": "book",
+                "identifier_type": "Google Books ID" if isbn.startswith("GB:") else "ISBN",
+            })
     return results
 
 
-AUTHOR_ALIASES = {
-    "shu qingchun": "老舍",
-    "she lao": "老舍",
-    "lao she": "老舍",
-    "舒庆春": "老舍",
-    "老舍": "老舍",
-}
+def normalize_issn(value):
+    compact = re.sub(r"[^0-9Xx]", "", str(value or ""))
+    if len(compact) != 8 or not compact[:7].isdigit():
+        return ""
+    check_value = 10 if compact[-1].upper() == "X" else int(compact[-1]) if compact[-1].isdigit() else -1
+    total = sum(int(digit) * weight for digit, weight in zip(compact[:7], range(8, 1, -1)))
+    if (total + check_value) % 11:
+        return ""
+    return f"{compact[:4]}-{compact[4:].upper()}"
+
+
+def crossref_journal_title(item):
+    title = item.get("title", "")
+    if isinstance(title, list):
+        title = title[0] if title else ""
+    return str(title).strip()
+
+
+@st.cache_data(ttl=600, max_entries=100, show_spinner=False)
+def lookup_crossref_journals(query):
+    query = query.strip()
+    if not query:
+        return []
+    query_issn = normalize_issn(query)
+    if query_issn:
+        url = f"https://api.crossref.org/journals/{quote(query_issn)}"
+    else:
+        url = (
+            "https://api.crossref.org/journals"
+            f"?query={quote(query)}&rows=100"
+        )
+    try:
+        message = fetch_json(url, timeout=15).get("message", {})
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    items = [message] if query_issn and isinstance(message, dict) else message.get("items", [])
+    query_key = re.sub(r"\W", "", query.lower())
+
+    def relevance(item):
+        title_key = re.sub(r"\W", "", crossref_journal_title(item).lower())
+        if title_key == query_key:
+            rank = 0
+        elif title_key.startswith(query_key):
+            rank = 1
+        elif query_key in title_key:
+            rank = 2
+        else:
+            rank = 3
+        return rank, len(title_key)
+
+    results = []
+    seen = set()
+    for item in sorted(items, key=relevance):
+        issns = [normalize_issn(value) for value in item.get("ISSN", [])]
+        issn = next((value for value in issns if value), "")
+        title = crossref_journal_title(item)
+        if not issn or not title or issn in seen:
+            continue
+        seen.add(issn)
+        subjects = item.get("subject", [])
+        results.append({
+            "isbn": f"ISSN:{issn}",
+            "name": title,
+            "author": str(item.get("publisher", "")).strip() or "未知出版机构",
+            "theme": "、".join(subjects[:3]) if isinstance(subjects, list) and subjects else "学术期刊",
+            "icon": "📰",
+            "item_type": "journal",
+            "identifier_type": "ISSN",
+        })
+        if len(results) >= 30:
+            break
+    return results
+
+
+def wikidata_author_from_description(description):
+    for pattern in (
+        r"作者[：:为是]?\s*([^，。,；;]+)",
+        r"([^，。,；;]+?)(?:创作|所著)的?(?:长篇|中篇|短篇)?小说",
+        r"([^，。,；;\s]+?)(?:所)?著(?:作)?$",
+        r"\bby\s+([^,.;]+)$",
+    ):
+        match = re.search(pattern, description, flags=re.IGNORECASE)
+        if match:
+            author = match.group(1).strip()
+            if author and not re.search(r"\d|年", author):
+                return author
+    return "未知作者"
+
+
+@st.cache_data(ttl=600, max_entries=100, show_spinner=False)
+def lookup_wikidata(query):
+    query = query.strip()
+    if not query:
+        return []
+    language = "zh-hans" if contains_chinese(query) else "en"
+    search_url = (
+        "https://www.wikidata.org/w/api.php"
+        "?action=wbsearchentities"
+        f"&search={quote(query)}&language={language}&uselang={language}"
+        "&type=item&limit=30&format=json"
+    )
+    try:
+        search_data = fetch_json(search_url)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    results = []
+    book_words = (
+        "书籍", "書籍", "图书", "圖書", "小说", "小說", "文学作品",
+        "文學作品", "著作", "诗集", "詩集", "文集", "散文", "童话",
+        "童話", "剧本", "劇本", "book", "novel", "literary work",
+    )
+    journal_words = (
+        "期刊", "学术杂志", "學術雜誌", "科学杂志", "科學雜誌",
+        "journal", "academic magazine", "scientific magazine", "periodical",
+    )
+    seen_titles = set()
+    for item in search_data.get("search", []):
+        entity_id = str(item.get("id", "")).strip()
+        title = str(item.get("label", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not entity_id.startswith("Q") or not title:
+            continue
+        description_lower = description.lower()
+        is_journal = any(word in description_lower for word in journal_words)
+        if not is_journal and not any(word in description_lower for word in book_words):
+            continue
+        title_key = re.sub(r"[^\w\u4e00-\u9fff]", "", title.lower())
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        results.append({
+            "isbn": f"WD:{entity_id}",
+            "name": title,
+            "author": "未知出版机构" if is_journal else wikidata_author_from_description(description),
+            "theme": description or "Wikidata 资料",
+            "icon": "📰" if is_journal else "📚",
+            "item_type": "journal" if is_journal else "book",
+            "identifier_type": "Wikidata ID",
+        })
+    return results
 
 
 def contains_chinese(value):
     return bool(re.search(r"[\u4e00-\u9fff]", str(value or "")))
 
 
+def is_known_author(author):
+    return str(author or "").strip().lower() not in {
+        "", "未知作者", "未知出版机构", "unknown", "unknown author", "unknown publisher",
+    }
+
+
+@st.cache_data(ttl=604800, max_entries=500, show_spinner=False)
+def lookup_wikidata_author(author):
+    """使用 Wikidata 的人物别名自动取得简体中文常用名。"""
+    author = str(author or "").strip()
+    if not is_known_author(author):
+        return "未知作者"
+    url = (
+        "https://www.wikidata.org/w/api.php"
+        "?action=wbsearchentities"
+        f"&search={quote(author)}&language=zh-hans&uselang=zh-hans"
+        "&type=item&limit=5&format=json"
+    )
+    try:
+        data = fetch_json(url)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return author
+    person_words = (
+        "作家", "作者", "诗人", "小说家", "文学家", "剧作家", "编剧",
+        "writer", "author", "poet", "novelist", "playwright", "human",
+    )
+    for item in data.get("search", []):
+        label = str(item.get("label", "")).strip()
+        description = str(item.get("description", "")).lower()
+        if label and any(word in description for word in person_words):
+            return label
+    return author
+
+
 def canonical_author(author):
-    text = " ".join(str(author or "未知作者").strip().lower().split())
-    return AUTHOR_ALIASES.get(text, str(author or "未知作者").strip())
+    parts = [
+        part.strip()
+        for part in re.split(r"[、,，;/；]+", str(author or ""))
+        if part.strip()
+    ]
+    if not parts:
+        return "未知作者"
+    return "、".join(lookup_wikidata_author(part) for part in parts[:3])
 
 
-def normalize_remote_results(results):
-    """优先中文书名，并删除同一作者同一书名的重复版本。"""
+def normalize_remote_results(results, query=""):
+    """优先中文书名，并合并同一中文书名的重复目录。"""
     normalized = []
     for book in results:
         item = dict(book)
-        item["author"] = canonical_author(item.get("author"))
+        item["author"] = str(item.get("author") or "未知作者").strip()
         item["name"] = str(item.get("name", "未知书名")).strip() or "未知书名"
+        item["item_type"] = item.get("item_type", "book")
+        item["identifier_type"] = item.get("identifier_type", "ISBN")
         normalized.append(item)
 
     # 同一搜索如果有中文标题，只保留中文标题，避免中英文版本同时出现。
     chinese_titles = [item for item in normalized if contains_chinese(item.get("name"))]
-    if chinese_titles:
+    if contains_chinese(query) and chinese_titles:
         normalized = chinese_titles
 
-    unique = []
-    seen = set()
+    grouped = {}
     for item in normalized:
+        title_key = (
+            item["item_type"],
+            re.sub(r"[^\w\u4e00-\u9fff]", "", item["name"].lower()),
+        )
+        grouped.setdefault(title_key, []).append(item)
+
+    authors_to_resolve = set()
+    for same_title_books in grouped.values():
+        group_authors = {
+            item["author"] for item in same_title_books
+            if is_known_author(item.get("author"))
+        }
+        author_keys = {
+            re.sub(r"[^\w\u4e00-\u9fff]", "", author.lower())
+            for author in group_authors
+        }
+        if len(author_keys) > 1:
+            authors_to_resolve.update(group_authors)
+    resolved_authors = {
+        author: canonical_author(author)
+        for author in sorted(authors_to_resolve)
+    }
+
+    unique = []
+    for same_title_books in grouped.values():
+        selected = dict(same_title_books[0])
+        authors = [
+            resolved_authors.get(item["author"], item["author"])
+            for item in same_title_books
+            if is_known_author(item.get("author"))
+        ]
+        if authors:
+            preferred = next(
+                (author for author in authors if contains_chinese(author)),
+                authors[0],
+            )
+            selected["author"] = preferred
+        unique.append(selected)
+
+    query_key = re.sub(r"[^\w\u4e00-\u9fff]", "", query.lower())
+    query_identifier = re.sub(r"[^0-9x]", "", query.lower())
+
+    def relevance(item):
         title_key = re.sub(r"[^\w\u4e00-\u9fff]", "", item["name"].lower())
-        author_key = re.sub(r"[^\w\u4e00-\u9fff]", "", item["author"].lower())
-        key = (title_key, author_key)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique
+        identifier_key = re.sub(r"[^0-9x]", "", str(item.get("isbn", "")).lower())
+        if query_identifier and len(query_identifier) >= 8 and query_identifier in identifier_key:
+            rank = -1
+        elif title_key == query_key:
+            rank = 0
+        elif query_key and title_key.startswith(query_key):
+            rank = 1
+        elif query_key and query_key in title_key:
+            rank = 2
+        else:
+            rank = 3
+        return rank, 0 if item.get("item_type") == "journal" else 1, len(title_key)
+
+    return sorted(unique, key=relevance)[:60]
 
 
 def admin_accounts_from_secrets():
@@ -265,6 +488,12 @@ def connect_db():
     return connection
 
 
+def ensure_column(db, table, column, definition):
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     with connect_db() as db:
         db.executescript(
@@ -275,6 +504,8 @@ def init_db():
                 author TEXT NOT NULL DEFAULT '',
                 theme TEXT NOT NULL DEFAULT '',
                 icon TEXT NOT NULL DEFAULT '📚',
+                item_type TEXT NOT NULL DEFAULT 'book',
+                identifier_type TEXT NOT NULL DEFAULT 'ISBN',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
@@ -318,8 +549,30 @@ def init_db():
                 visit_date TEXT PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS book_requests (
+                id TEXT PRIMARY KEY,
+                requested_by TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT '',
+                theme TEXT NOT NULL DEFAULT '',
+                icon TEXT NOT NULL DEFAULT '📚',
+                item_type TEXT NOT NULL DEFAULT 'book',
+                identifier_type TEXT NOT NULL DEFAULT 'ISBN',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                reviewed_by TEXT,
+                UNIQUE(requested_by, book_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_book_requests_status
+            ON book_requests(status, created_at);
             """
         )
+        ensure_column(db, "books", "item_type", "TEXT NOT NULL DEFAULT 'book'")
+        ensure_column(db, "books", "identifier_type", "TEXT NOT NULL DEFAULT 'ISBN'")
+        ensure_column(db, "book_requests", "item_type", "TEXT NOT NULL DEFAULT 'book'")
+        ensure_column(db, "book_requests", "identifier_type", "TEXT NOT NULL DEFAULT 'ISBN'")
         migrate_legacy_data(db)
 
 
@@ -403,6 +656,52 @@ def books(include_disabled=False):
     query += " ORDER BY name COLLATE NOCASE"
     with connect_db() as db:
         return [dict(row) for row in db.execute(query)]
+
+
+def popular_books(limit=6):
+    with connect_db() as db:
+        rows = db.execute(
+            """
+            SELECT b.*,
+                   (SELECT COUNT(*)
+                    FROM comments c
+                    WHERE c.isbn=b.isbn AND c.parent_id IS NULL) AS comments_count,
+                   (SELECT COUNT(*)
+                    FROM comment_likes cl
+                    JOIN comments c ON c.id=cl.comment_id
+                    WHERE c.isbn=b.isbn) AS likes_count
+            FROM books b
+            WHERE b.enabled=1
+            ORDER BY comments_count DESC, likes_count DESC, b.name COLLATE NOCASE
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def item_type_label(item):
+    return "期刊" if item.get("item_type") == "journal" else "书籍"
+
+
+def item_creator_label(item):
+    return "出版机构" if item.get("item_type") == "journal" else "作者"
+
+
+def item_identifier(item):
+    value = str(item.get("isbn", item.get("book_id", "")))
+    if value.startswith(("ISSN:", "WD:")):
+        return value.split(":", 1)[1]
+    return value
+
+
+def item_identifier_text(item):
+    identifier_type = item.get("identifier_type") or (
+        "ISSN" if str(item.get("isbn", item.get("book_id", ""))).startswith("ISSN:") else "ISBN"
+    )
+    return f"{identifier_type}：{item_identifier(item)}"
+
+
 def save_remote_book(book):
     with connect_db() as db:
         db.execute(
@@ -413,15 +712,19 @@ def save_remote_book(book):
                 author,
                 theme,
                 icon,
+                item_type,
+                identifier_type,
                 enabled,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(isbn) DO UPDATE SET
                 name = excluded.name,
                 author = excluded.author,
                 theme = excluded.theme,
                 icon = excluded.icon,
+                item_type = excluded.item_type,
+                identifier_type = excluded.identifier_type,
                 enabled = 1
             """,
             (
@@ -430,9 +733,158 @@ def save_remote_book(book):
                 book["author"],
                 book["theme"],
                 book["icon"],
+                book.get("item_type", "book"),
+                book.get("identifier_type", "ISBN"),
                 now_text(),
             ),
         )
+
+
+def book_request_status(book_id, account):
+    if get_book(book_id):
+        return "added"
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT status FROM book_requests WHERE requested_by=? AND book_id=?",
+            (str(account), str(book_id)),
+        ).fetchone()
+    return row["status"] if row else None
+
+
+def create_book_request(book, account):
+    if get_book(book["isbn"]):
+        return "added"
+    request_id = uuid.uuid4().hex
+    with connect_db() as db:
+        existing = db.execute(
+            "SELECT status FROM book_requests WHERE requested_by=? AND book_id=?",
+            (str(account), str(book["isbn"])),
+        ).fetchone()
+        if existing and existing["status"] in ("pending", "approved"):
+            return existing["status"]
+        if existing:
+            db.execute(
+                """
+                UPDATE book_requests
+                SET name=?,author=?,theme=?,icon=?,item_type=?,identifier_type=?,
+                    status='pending',created_at=?,
+                    reviewed_at=NULL,reviewed_by=NULL
+                WHERE requested_by=? AND book_id=?
+                """,
+                (
+                    book["name"],
+                    book["author"],
+                    book["theme"],
+                    book["icon"],
+                    book.get("item_type", "book"),
+                    book.get("identifier_type", "ISBN"),
+                    now_text(),
+                    str(account),
+                    str(book["isbn"]),
+                ),
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO book_requests(
+                    id,requested_by,book_id,name,author,theme,icon,item_type,
+                    identifier_type,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)
+                """,
+                (
+                    request_id,
+                    str(account),
+                    str(book["isbn"]),
+                    book["name"],
+                    book["author"],
+                    book["theme"],
+                    book["icon"],
+                    book.get("item_type", "book"),
+                    book.get("identifier_type", "ISBN"),
+                    now_text(),
+                ),
+            )
+    return "pending"
+
+
+def pending_book_requests():
+    with connect_db() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM book_requests
+            WHERE status='pending'
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def pending_request_count():
+    with connect_db() as db:
+        return db.execute(
+            "SELECT COUNT(*) FROM book_requests WHERE status='pending'"
+        ).fetchone()[0]
+
+
+def review_book_request(request_id, approved):
+    reviewer = current_user()
+    if not reviewer or not is_admin():
+        return False
+    with connect_db() as db:
+        request_row = db.execute(
+            "SELECT * FROM book_requests WHERE id=? AND status='pending'",
+            (request_id,),
+        ).fetchone()
+    if not request_row:
+        return False
+    request_item = dict(request_row)
+    if approved:
+        save_remote_book({
+            "isbn": request_item["book_id"],
+            "name": request_item["name"],
+            "author": request_item["author"],
+            "theme": request_item["theme"],
+            "icon": request_item["icon"],
+            "item_type": request_item.get("item_type", "book"),
+            "identifier_type": request_item.get("identifier_type", "ISBN"),
+        })
+        with connect_db() as db:
+            accounts = {
+                row[0]
+                for row in db.execute(
+                    "SELECT requested_by FROM book_requests WHERE book_id=? AND status='pending'",
+                    (request_item["book_id"],),
+                )
+            }
+            db.execute(
+                """
+                UPDATE book_requests
+                SET status='approved',reviewed_at=?,reviewed_by=?
+                WHERE book_id=? AND status='pending'
+                """,
+                (now_text(), reviewer["account"], request_item["book_id"]),
+            )
+        notify_users(
+            accounts,
+            "书刊添加申请已通过",
+            f"《{request_item['name']}》已加入馆藏。",
+        )
+    else:
+        with connect_db() as db:
+            db.execute(
+                """
+                UPDATE book_requests
+                SET status='rejected',reviewed_at=?,reviewed_by=?
+                WHERE id=?
+                """,
+                (now_text(), reviewer["account"], request_id),
+            )
+        notify_users(
+            {request_item["requested_by"]},
+            "书刊添加申请未通过",
+            f"《{request_item['name']}》暂未加入馆藏。",
+        )
+    return True
 
 
 def get_book(isbn):
@@ -455,13 +907,23 @@ def search_books(query):
 
 
 def open_book(isbn):
-    """打开书籍留言页。"""
+    """打开书刊留言页。"""
     if get_book(isbn) is None:
-        st.error("书籍不存在或已被停用。")
+        st.error("该书刊不存在或已被停用。")
         return
     st.session_state.current_book = isbn
     st.session_state.page = "首页"
     st.rerun()
+
+
+def back_home_button(key):
+    if st.button("返回首页", key=key):
+        st.session_state.page = "首页"
+        st.session_state.current_book = None
+        st.session_state.search_query = ""
+        st.session_state.search_results = []
+        st.session_state.remote_results = []
+        st.rerun()
 
 
 def comment_rows(isbn):
@@ -663,14 +1125,18 @@ def render_comment(comment, isbn, depth=0):
 
 
 def show_book_page(isbn):
+    back_home_button(f"home_{isbn}")
     book = get_book(isbn)
     if not book:
-        st.error("书籍不存在或已被删除。")
+        st.error("该书刊不存在或已被删除。")
         return
     account = current_user().get("account") if current_user() else None
     comments = comment_tree(isbn, account)
     st.header(f"{book['icon']} {book['name']}")
-    st.caption(f"作者：{book['author']} · 主题：{book['theme']} · ISBN：{isbn}")
+    st.caption(
+        f"类型：{item_type_label(book)} · {item_creator_label(book)}：{book['author']} · "
+        f"主题：{book['theme']} · {item_identifier_text(book)}"
+    )
     st.subheader(f"留言（{len(comments)} 条）")
     if not comments:
         st.info("暂时没有留言。")
@@ -687,12 +1153,8 @@ def show_book_page(isbn):
                 st.warning("主题和留言内容不能为空。")
     else:
         st.info("登录后可以发布留言、点赞和回复。")
-    if st.button("返回首页", key=f"home_{isbn}"):
-        st.session_state.current_book = None
-        st.rerun()
-
-
 def show_my_messages():
+    back_home_button("home_from_my_messages")
     user = current_user()
     if not user:
         st.info("请先登录。")
@@ -708,6 +1170,7 @@ def show_my_messages():
 
 
 def show_notifications():
+    back_home_button("home_from_notifications")
     user = current_user()
     if not user:
         st.info("请先登录。")
@@ -725,50 +1188,140 @@ def show_notifications():
 
 
 def show_book_admin():
+    back_home_button("home_from_book_admin")
     if not is_admin():
-        st.error("只有管理员可以管理书籍。")
+        st.error("只有管理员可以管理书刊。")
         return
-    st.header("书籍管理")
+    st.header("书刊管理")
     all_books = books(include_disabled=True)
     with st.form("add_book"):
-        st.subheader("添加书籍")
-        isbn = st.text_input("ISBN")
-        name = st.text_input("书名")
-        author = st.text_input("作者")
+        st.subheader("添加书籍或期刊")
+        item_type = st.selectbox(
+            "类型", ["book", "journal"],
+            format_func=lambda value: "书籍" if value == "book" else "期刊",
+        )
+        isbn = st.text_input("ISBN 或 ISSN")
+        name = st.text_input("书名或期刊名")
+        author = st.text_input("作者或出版机构")
         theme = st.text_input("主题")
         icon = st.text_input("图标", value="📚")
         if st.form_submit_button("添加"):
             if not isbn.strip() or not name.strip():
-                st.error("ISBN 和书名不能为空。")
+                st.error("标识符和名称不能为空。")
             else:
+                identifier = isbn.strip()
+                identifier_type = "ISBN"
+                if item_type == "journal":
+                    normalized_issn = normalize_issn(identifier)
+                    if not normalized_issn:
+                        st.error("请输入有效的 ISSN，例如 0028-0836。")
+                        st.stop()
+                    identifier = f"ISSN:{normalized_issn}"
+                    identifier_type = "ISSN"
+                chosen_icon = icon.strip() or ("📰" if item_type == "journal" else "📚")
+                if item_type == "journal" and chosen_icon == "📚":
+                    chosen_icon = "📰"
                 try:
                     with connect_db() as db:
-                        db.execute("INSERT INTO books(isbn,name,author,theme,icon,enabled,created_at) VALUES(?,?,?,?,?,1,?)", (isbn.strip(), name.strip(), author.strip(), theme.strip(), icon.strip() or "📚", now_text()))
-                    st.success("书籍已添加。")
+                        db.execute(
+                            """
+                            INSERT INTO books(
+                                isbn,name,author,theme,icon,item_type,
+                                identifier_type,enabled,created_at
+                            ) VALUES(?,?,?,?,?,?,?,1,?)
+                            """,
+                            (
+                                identifier, name.strip(), author.strip(), theme.strip(),
+                                chosen_icon,
+                                item_type, identifier_type, now_text(),
+                            ),
+                        )
+                    st.success("书刊已添加。")
                     st.rerun()
                 except sqlite3.IntegrityError:
-                    st.error("该 ISBN 已存在。")
+                    st.error("该 ISBN 或 ISSN 已存在。")
     if all_books:
-        selected = st.selectbox("选择要编辑的书籍", [book["isbn"] for book in all_books])
+        selected = st.selectbox("选择要编辑的书刊", [book["isbn"] for book in all_books])
         book = next(book for book in all_books if book["isbn"] == selected)
         with st.form(f"edit_book_{selected}"):
-            name = st.text_input("书名", value=book["name"])
-            author = st.text_input("作者", value=book["author"])
+            item_type = book.get("item_type", "book")
+            st.text_input("类型", value=item_type_label(book), disabled=True)
+            name = st.text_input("书名或期刊名", value=book["name"])
+            author = st.text_input("作者或出版机构", value=book["author"])
             theme = st.text_input("主题", value=book["theme"])
             icon = st.text_input("图标", value=book["icon"])
             enabled = st.checkbox("启用", value=bool(book["enabled"]))
             if st.form_submit_button("保存修改"):
                 with connect_db() as db:
-                    db.execute("UPDATE books SET name=?,author=?,theme=?,icon=?,enabled=? WHERE isbn=?", (name.strip(), author.strip(), theme.strip(), icon.strip() or "📚", int(enabled), selected))
-                st.success("书籍已更新。")
+                    db.execute(
+                        """
+                        UPDATE books
+                        SET name=?,author=?,theme=?,icon=?,item_type=?,identifier_type=?,enabled=?
+                        WHERE isbn=?
+                        """,
+                        (
+                            name.strip(), author.strip(), theme.strip(),
+                            icon.strip() or ("📰" if item_type == "journal" else "📚"),
+                            item_type, book.get("identifier_type", "ISBN"),
+                            int(enabled), selected,
+                        ),
+                    )
+                st.success("书刊已更新。")
                 st.rerun()
-        if comment_count(selected) == 0 and st.button("删除该书籍", key=f"remove_book_{selected}"):
+        if comment_count(selected) == 0 and st.button("删除该书刊", key=f"remove_book_{selected}"):
             with connect_db() as db:
                 db.execute("DELETE FROM books WHERE isbn=?", (selected,))
-            st.success("书籍已删除。")
+            st.success("书刊已删除。")
             st.rerun()
         elif comment_count(selected):
-            st.caption("该书已有留言，不能删除；可以停用。")
+            st.caption("该书刊已有留言，不能删除；可以停用。")
+
+
+def show_all_books():
+    back_home_button("home_from_all_books")
+    st.header("全部书刊")
+    all_books = books()
+    if not all_books:
+        st.info("馆藏中暂时没有书籍或期刊。")
+        return
+    cols = st.columns(3)
+    for index, book in enumerate(all_books):
+        with cols[index % 3]:
+            st.write(f"{book['icon']} **{book['name']}**")
+            st.caption(
+                f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
+                f"留言 {comment_count(book['isbn'])}"
+            )
+            if st.button("查看留言", key=f"all_book_{book['isbn']}"):
+                open_book(book["isbn"])
+
+
+def show_book_requests_admin():
+    back_home_button("home_from_book_requests")
+    if not is_admin():
+        st.error("只有管理员可以审核书刊申请。")
+        return
+    st.header("书刊添加申请")
+    requests = pending_book_requests()
+    if not requests:
+        st.info("暂无待审核申请。")
+        return
+    for item in requests:
+        st.write(
+            f"**{item['name']}** · {item_type_label(item)} · {item['author']} · "
+            f"{item_identifier_text(item)}"
+        )
+        st.caption(f"申请账号：{item['requested_by']} · {item['created_at']}")
+        approve_col, reject_col, _ = st.columns([1, 1, 5])
+        if approve_col.button("批准", key=f"approve_request_{item['id']}"):
+            if review_book_request(item["id"], True):
+                st.success("已加入馆藏并通知申请者。")
+                st.rerun()
+        if reject_col.button("拒绝", key=f"reject_request_{item['id']}"):
+            if review_book_request(item["id"], False):
+                st.success("已拒绝并通知申请者。")
+                st.rerun()
+        st.divider()
 
 
 def account_panel():
@@ -778,16 +1331,25 @@ def account_panel():
         st.sidebar.write(f"已登录：{user['name']}{'（管理员）' if is_admin() else ''}")
         if st.sidebar.button(f"通知（{unread}）"):
             st.session_state.page = "通知"
+            st.session_state.current_book = None
             st.rerun()
-        if is_admin() and st.sidebar.button("书籍管理"):
-            st.session_state.page = "书籍管理"
-            st.rerun()
+        if is_admin():
+            if st.sidebar.button(f"书刊申请（{pending_request_count()}）"):
+                st.session_state.page = "书刊申请"
+                st.session_state.current_book = None
+                st.rerun()
+            if st.sidebar.button("书刊管理"):
+                st.session_state.page = "书刊管理"
+                st.session_state.current_book = None
+                st.rerun()
         if st.sidebar.button("我的留言"):
             st.session_state.page = "我的留言"
+            st.session_state.current_book = None
             st.rerun()
         if st.sidebar.button("退出登录"):
             st.session_state.user = None
             st.session_state.page = "首页"
+            st.session_state.current_book = None
             st.rerun()
         return
     mode = st.sidebar.radio("账户", ["登录", "注册"], horizontal=True)
@@ -848,6 +1410,8 @@ if "remote_results" not in st.session_state:
     st.session_state.remote_results = []
 if "search_query" not in st.session_state:
     st.session_state.search_query = ""
+if "search_kind" not in st.session_state:
+    st.session_state.search_kind = "book"
 record_visit()
 
 
@@ -855,23 +1419,44 @@ with st.sidebar:
     st.header("账户")
     account_panel()
     st.divider()
+    search_kind = st.radio(
+        "搜索类型",
+        ["book", "journal"],
+        index=0 if st.session_state.search_kind == "book" else 1,
+        format_func=lambda value: "搜索书籍" if value == "book" else "搜索期刊",
+        horizontal=True,
+    )
     with st.form("search"):
-        query = st.text_input("搜索书名、作者或 ISBN")
+        query = st.text_input(
+            "搜索书名、作者或 ISBN" if search_kind == "book" else "搜索期刊名、出版机构或 ISSN"
+        )
 
         if st.form_submit_button("搜索"):
             query = query.strip()
-
+            st.session_state.search_kind = search_kind
             st.session_state.search_query = query
-            st.session_state.search_results = search_books(query)
+            st.session_state.search_results = search_books(query) if search_kind == "book" else []
             st.session_state.remote_results = []
+            st.session_state.page = "首页"
+            st.session_state.current_book = None
 
-            if query and not st.session_state.search_results:
-                st.session_state.remote_results = lookup_open_library(query)
-                if not st.session_state.remote_results:
-                    st.session_state.remote_results = lookup_google_books(query)
-                st.session_state.remote_results = normalize_remote_results(
-                    st.session_state.remote_results
-                )
+            if query:
+                if search_kind == "journal":
+                    remote_results = normalize_remote_results(
+                        lookup_crossref_journals(query) + lookup_wikidata(query),
+                        query,
+                    )
+                else:
+                    remote_results = normalize_remote_results(
+                        lookup_open_library(query)
+                        + lookup_google_books(query)
+                        + lookup_wikidata(query),
+                        query,
+                    )
+                local_ids = {book["isbn"] for book in books(include_disabled=True)}
+                st.session_state.remote_results = [
+                    item for item in remote_results if item["isbn"] not in local_ids
+                ]
     st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
@@ -883,51 +1468,80 @@ elif page == "我的留言":
     show_my_messages()
 elif page == "通知":
     show_notifications()
-elif page == "书籍管理":
+elif page == "书刊管理":
     show_book_admin()
+elif page == "书刊申请":
+    show_book_requests_admin()
+elif page == "全部书刊":
+    show_all_books()
 else:
     results = st.session_state.get("search_results", [])
     if st.session_state.get("search_query"):
         st.subheader(f"搜索结果：{st.session_state.search_query}")
         for book in results:
-            if st.button(f"{book['icon']} {book['name']} · {book['isbn']}", key=f"result_{book['isbn']}"):
+            if st.button(
+                f"{book['icon']} {book['name']} · {item_type_label(book)} · "
+                f"{item_identifier_text(book)}",
+                key=f"result_{book['isbn']}",
+            ):
                 open_book(book["isbn"])
     remote_results = st.session_state.get("remote_results", [])
 
     if remote_results:
-        st.subheader("在线书籍")
+        st.subheader("在线书刊")
 
         for book in remote_results:
             st.write(
                 f"{book['icon']} **{book['name']}**"
-                f" · {book['author']}"
-                f" · ISBN：{book['isbn']}"
+                f" · {item_type_label(book)}"
+                f" · {item_creator_label(book)}：{book['author']}"
+                f" · {item_identifier_text(book)}"
             )
 
             if is_admin():
                 if st.button(
-                        "导入到书库",
+                        "导入馆藏",
                         key=f"import_{book['isbn']}"
                 ):
                     save_remote_book(book)
                     st.session_state.remote_results = []
-                    st.success("书籍已自动导入到书库。")
+                    st.success("书刊已自动导入馆藏。")
                     st.rerun()
             else:
-                st.caption("只有管理员可以导入书籍。")
+                user = current_user()
+                if not user:
+                    st.caption("登录后可以向管理员申请添加。")
+                else:
+                    status = book_request_status(book["isbn"], user["account"])
+                    if status == "added" or status == "approved":
+                        st.caption("该书刊已加入馆藏。")
+                    elif status == "pending":
+                        st.caption("已申请，等待管理员审核。")
+                    elif st.button("申请添加", key=f"request_{book['isbn']}"):
+                        create_book_request(book, user["account"])
+                        st.success("申请已提交，管理员审核后会通知你。")
+                        st.rerun()
 
     if st.session_state.get("search_query") and not results and not remote_results:
-        st.info("本地书库和在线书籍资料库都没有找到相关书籍，或在线服务暂时不可用。")
+        kind_label = "期刊" if st.session_state.get("search_kind") == "journal" else "书籍"
+        st.info(f"本地馆藏和在线资料库都没有找到相关{kind_label}，或在线服务暂时不可用。")
 
-    st.subheader("书籍")
-    visible_books = books()
+    st.subheader("热门书刊")
+    visible_books = popular_books(6)
     cols = st.columns(3)
     for index, book in enumerate(visible_books):
         with cols[index % 3]:
             st.write(f"{book['icon']} **{book['name']}**")
-            st.caption(f"{book['author']} · {book['theme']} · 留言 {comment_count(book['isbn'])}")
+            st.caption(
+                f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
+                f"留言 {comment_count(book['isbn'])}"
+            )
             if st.button("查看留言", key=f"book_{book['isbn']}"):
                 open_book(book["isbn"])
+    if st.button("查看全部书刊"):
+        st.session_state.page = "全部书刊"
+        st.session_state.current_book = None
+        st.rerun()
     st.subheader("热门搜索")
     with connect_db() as db:
         hot_searches = [row[0] for row in db.execute("SELECT query FROM searches ORDER BY count DESC, last_used DESC LIMIT 10")]
