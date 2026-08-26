@@ -154,6 +154,75 @@ def lookup_google_books(query):
     return results
 
 
+def openalex_abstract(inverted_index):
+    if not isinstance(inverted_index, dict):
+        return ""
+    words = []
+    for word, positions in inverted_index.items():
+        for position in positions if isinstance(positions, list) else []:
+            words.append((int(position), str(word)))
+    return " ".join(word for _, word in sorted(words))
+
+
+@st.cache_data(ttl=900, max_entries=100, show_spinner=False)
+def lookup_openalex_papers(query):
+    query = query.strip()
+    if not query:
+        return []
+    url = (
+        "https://api.openalex.org/works"
+        f"?search={quote(query)}&per-page=40&sort=relevance_score:desc"
+    )
+    try:
+        data = fetch_json(url, timeout=20)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    results = []
+    seen = set()
+    for work in data.get("results", []):
+        work_id = str(work.get("id", "")).strip()
+        doi = str(work.get("doi", "")).strip()
+        doi_key = doi.lower().replace("https://doi.org/", "") if doi else ""
+        identifier = f"DOI:{doi_key}" if doi_key else f"OA:{work_id.rsplit('/', 1)[-1]}"
+        if identifier in seen:
+            continue
+        title = str(work.get("title", "")).strip()
+        if not title:
+            continue
+        seen.add(identifier)
+        authors = []
+        for authorship in work.get("authorships", [])[:5]:
+            author_name = str(authorship.get("author", {}).get("display_name", "")).strip()
+            if author_name:
+                authors.append(author_name)
+        concepts = [
+            str(concept.get("display_name", "")).strip()
+            for concept in work.get("concepts", [])[:5]
+            if concept.get("display_name")
+        ]
+        location = work.get("primary_location") or {}
+        source = location.get("source") or {}
+        landing_url = str(location.get("landing_page_url") or "").strip()
+        pdf_url = str((location.get("pdf_url") or "")).strip()
+        external_url = landing_url or pdf_url or doi or f"https://openalex.org/{work_id.rsplit('/', 1)[-1]}"
+        results.append({
+            "isbn": identifier,
+            "name": title,
+            "author": "、".join(authors) or "未知作者",
+            "theme": "、".join(concepts) or "学术论文",
+            "icon": "📄",
+            "item_type": "paper",
+            "identifier_type": "DOI" if doi_key else "OpenAlex ID",
+            "doi": doi_key,
+            "abstract": openalex_abstract(work.get("abstract_inverted_index")),
+            "source_url": external_url,
+            "journal_name": str(source.get("display_name") or "").strip(),
+            "published_at": str(work.get("publication_date") or work.get("publication_year") or ""),
+            "citation_count": int(work.get("cited_by_count") or 0),
+        })
+    return results
+
+
 def normalize_issn(value):
     compact = re.sub(r"[^0-9Xx]", "", str(value or ""))
     if len(compact) != 8 or not compact[:7].isdigit():
@@ -567,6 +636,10 @@ def init_db():
                 parent_isbn TEXT NOT NULL DEFAULT '',
                 published_at TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
+                doi TEXT NOT NULL DEFAULT '',
+                abstract TEXT NOT NULL DEFAULT '',
+                journal_name TEXT NOT NULL DEFAULT '',
+                citation_count INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
@@ -620,6 +693,12 @@ def init_db():
                 icon TEXT NOT NULL DEFAULT '📚',
                 item_type TEXT NOT NULL DEFAULT 'book',
                 identifier_type TEXT NOT NULL DEFAULT 'ISBN',
+                doi TEXT NOT NULL DEFAULT '',
+                abstract TEXT NOT NULL DEFAULT '',
+                journal_name TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                citation_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 reviewed_at TEXT,
@@ -635,8 +714,18 @@ def init_db():
         ensure_column(db, "books", "parent_isbn", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "books", "published_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "books", "source_url", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "doi", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "abstract", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "journal_name", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "books", "citation_count", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "book_requests", "item_type", "TEXT NOT NULL DEFAULT 'book'")
         ensure_column(db, "book_requests", "identifier_type", "TEXT NOT NULL DEFAULT 'ISBN'")
+        ensure_column(db, "book_requests", "doi", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "book_requests", "abstract", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "book_requests", "journal_name", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "book_requests", "published_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "book_requests", "source_url", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "book_requests", "citation_count", "INTEGER NOT NULL DEFAULT 0")
         migrate_legacy_data(db)
 
 
@@ -752,6 +841,8 @@ def item_type_label(item):
         return "期刊"
     if item.get("item_type") == "journal_issue":
         return "期次"
+    if item.get("item_type") == "paper":
+        return "论文"
     return "书籍"
 
 
@@ -809,7 +900,7 @@ def save_journal_issues(journal, issues):
 
 def item_identifier(item):
     value = str(item.get("isbn", item.get("book_id", "")))
-    if value.startswith(("ISSN:", "WD:")):
+    if value.startswith(("ISSN:", "WD:", "DOI:", "OA:")):
         return value.split(":", 1)[1]
     return value
 
@@ -836,10 +927,16 @@ def save_remote_book(book):
                 item_type,
                 identifier_type,
                 parent_isbn,
+                published_at,
+                source_url,
+                doi,
+                abstract,
+                journal_name,
+                citation_count,
                 enabled,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(isbn) DO UPDATE SET
                 name = excluded.name,
                 author = excluded.author,
@@ -848,6 +945,12 @@ def save_remote_book(book):
                 item_type = excluded.item_type,
                 identifier_type = excluded.identifier_type,
                 parent_isbn = excluded.parent_isbn,
+                published_at = excluded.published_at,
+                source_url = excluded.source_url,
+                doi = excluded.doi,
+                abstract = excluded.abstract,
+                journal_name = excluded.journal_name,
+                citation_count = excluded.citation_count,
                 enabled = 1
             """,
             (
@@ -859,6 +962,12 @@ def save_remote_book(book):
                 book.get("item_type", "book"),
                 book.get("identifier_type", "ISBN"),
                 book.get("parent_isbn", ""),
+                book.get("published_at", ""),
+                book.get("source_url", ""),
+                book.get("doi", ""),
+                book.get("abstract", ""),
+                book.get("journal_name", ""),
+                int(book.get("citation_count", 0) or 0),
                 now_text(),
             ),
         )
@@ -891,6 +1000,7 @@ def create_book_request(book, account):
                 """
                 UPDATE book_requests
                 SET name=?,author=?,theme=?,icon=?,item_type=?,identifier_type=?,
+                    doi=?,abstract=?,journal_name=?,published_at=?,source_url=?,citation_count=?,
                     status='pending',created_at=?,
                     reviewed_at=NULL,reviewed_by=NULL
                 WHERE requested_by=? AND book_id=?
@@ -902,6 +1012,12 @@ def create_book_request(book, account):
                     book["icon"],
                     book.get("item_type", "book"),
                     book.get("identifier_type", "ISBN"),
+                    book.get("doi", ""),
+                    book.get("abstract", ""),
+                    book.get("journal_name", ""),
+                    book.get("published_at", ""),
+                    book.get("source_url", ""),
+                    int(book.get("citation_count", 0) or 0),
                     now_text(),
                     str(account),
                     str(book["isbn"]),
@@ -912,8 +1028,9 @@ def create_book_request(book, account):
                 """
                 INSERT INTO book_requests(
                     id,requested_by,book_id,name,author,theme,icon,item_type,
-                    identifier_type,status,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)
+                    identifier_type,doi,abstract,journal_name,published_at,source_url,
+                    citation_count,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)
                 """,
                 (
                     request_id,
@@ -925,6 +1042,12 @@ def create_book_request(book, account):
                     book["icon"],
                     book.get("item_type", "book"),
                     book.get("identifier_type", "ISBN"),
+                    book.get("doi", ""),
+                    book.get("abstract", ""),
+                    book.get("journal_name", ""),
+                    book.get("published_at", ""),
+                    book.get("source_url", ""),
+                    int(book.get("citation_count", 0) or 0),
                     now_text(),
                 ),
             )
@@ -971,6 +1094,12 @@ def review_book_request(request_id, approved):
             "icon": request_item["icon"],
             "item_type": request_item.get("item_type", "book"),
             "identifier_type": request_item.get("identifier_type", "ISBN"),
+            "doi": request_item.get("doi", ""),
+            "abstract": request_item.get("abstract", ""),
+            "journal_name": request_item.get("journal_name", ""),
+            "published_at": request_item.get("published_at", ""),
+            "source_url": request_item.get("source_url", ""),
+            "citation_count": request_item.get("citation_count", 0),
         })
         with connect_db() as db:
             accounts = {
@@ -1262,6 +1391,18 @@ def show_book_page(isbn):
         f"类型：{item_type_label(book)} · {item_creator_label(book)}：{book['author']} · "
         f"主题：{book['theme']} · {item_identifier_text(book)}"
     )
+    if book.get("item_type") == "paper":
+        if book.get("journal_name") or book.get("published_at"):
+            st.caption(
+                f"期刊：{book.get('journal_name') or '未知期刊'} · "
+                f"发表时间：{book.get('published_at') or '未知'} · "
+                f"被引：{book.get('citation_count', 0)}"
+            )
+        if book.get("abstract"):
+            st.subheader("摘要")
+            st.write(book["abstract"])
+        if book.get("source_url"):
+            st.markdown(f"[打开论文原文或来源页面]({book['source_url']})")
     st.subheader(f"留言（{len(comments)} 条）")
     if not comments:
         st.info("暂时没有留言。")
@@ -1582,21 +1723,29 @@ with st.sidebar:
     st.divider()
     search_kind = st.radio(
         "搜索类型",
-        ["book", "journal"],
-        index=0 if st.session_state.search_kind == "book" else 1,
-        format_func=lambda value: "搜索书籍" if value == "book" else "搜索期刊",
+        ["book", "journal", "paper"],
+        index={"book": 0, "journal": 1, "paper": 2}.get(st.session_state.search_kind, 0),
+        format_func=lambda value: {
+            "book": "搜索书籍",
+            "journal": "搜索期刊",
+            "paper": "搜索论文",
+        }[value],
         horizontal=True,
     )
     with st.form("search"):
         query = st.text_input(
-            "搜索书名、作者或 ISBN" if search_kind == "book" else "搜索期刊名、出版机构或 ISSN"
+            "搜索书名、作者或 ISBN"
+            if search_kind == "book"
+            else "搜索论文标题、作者、关键词或 DOI"
+            if search_kind == "paper"
+            else "搜索期刊名、出版机构或 ISSN"
         )
 
         if st.form_submit_button("搜索"):
             query = query.strip()
             st.session_state.search_kind = search_kind
             st.session_state.search_query = query
-            st.session_state.search_results = search_books(query) if search_kind == "book" else []
+            st.session_state.search_results = search_books(query) if search_kind in ("book", "paper") else []
             st.session_state.remote_results = []
             st.session_state.page = "首页"
             st.session_state.current_book = None
@@ -1606,6 +1755,11 @@ with st.sidebar:
                 if search_kind == "journal":
                     remote_results = normalize_remote_results(
                         lookup_crossref_journals(query) + lookup_wikidata(query),
+                        query,
+                    )
+                elif search_kind == "paper":
+                    remote_results = normalize_remote_results(
+                        lookup_openalex_papers(query),
                         query,
                     )
                 else:
@@ -1652,7 +1806,7 @@ else:
     remote_results = st.session_state.get("remote_results", [])
 
     if remote_results:
-        st.subheader("在线书刊")
+        st.subheader("在线资料")
 
         for book in remote_results:
             st.write(
@@ -1695,7 +1849,11 @@ else:
                         st.rerun()
 
     if st.session_state.get("search_query") and not results and not remote_results:
-        kind_label = "期刊" if st.session_state.get("search_kind") == "journal" else "书籍"
+        kind_label = {
+            "book": "书籍",
+            "journal": "期刊",
+            "paper": "论文",
+        }.get(st.session_state.get("search_kind"), "资料")
         st.info(f"本地馆藏和在线资料库都没有找到相关{kind_label}，或在线服务暂时不可用。")
 
     st.subheader("热门书刊")
