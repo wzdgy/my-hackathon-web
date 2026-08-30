@@ -1403,6 +1403,11 @@ def show_book_page(isbn):
             st.write(book["abstract"])
         if book.get("source_url"):
             st.markdown(f"[打开论文原文或来源页面]({book['source_url']})")
+        st.link_button(
+            "在新标签页打开知网检索",
+            cnki_search_url(book),
+            help="知网页面会在新的浏览器标签页打开；返回本标签页即可继续评论。",
+        )
     st.subheader(f"留言（{len(comments)} 条）")
     if not comments:
         st.info("暂时没有留言。")
@@ -1594,6 +1599,14 @@ def show_journal_issues():
             st.caption(issue["url"])
         if st.button("查看本期期次留言", key=f"issue_{issue['isbn']}"):
             open_book(issue["isbn"])
+
+
+def cnki_search_url(item):
+    """生成知网检索链接；知网阅读和账号权限仍由知网页面负责。"""
+    title = str(item.get("name", "")).strip()
+    doi = str(item.get("doi", "")).strip()
+    query = " ".join(part for part in (title, doi) if part)
+    return f"https://kns.cnki.net/kns8s/defaultresult/index?kw={quote(query)}"
 
 
 def show_book_requests_admin():
