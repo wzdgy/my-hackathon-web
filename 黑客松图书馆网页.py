@@ -1252,6 +1252,74 @@ def delete_comment(comment_id):
         notify_users({target["user_account"]}, "你的留言已被管理员删除", f"《{get_book(target['isbn'])['name']}》中的留言已被管理员删除。")
 
 
+def request_confirmation(action, **payload):
+    st.session_state.pending_confirmation = {"action": action, **payload}
+
+
+@st.dialog("请确认操作")
+def confirmation_dialog():
+    pending = st.session_state.get("pending_confirmation") or {}
+    action = pending.get("action")
+    if action == "delete_comment":
+        st.warning("确定要删除这条留言吗？删除后无法恢复。")
+    elif action == "submit_comment":
+        st.info("确定要提交这条留言吗？")
+    elif action == "submit_reply":
+        st.info("确定要提交这条回复吗？")
+    elif action == "import_book":
+        book = pending.get("book") or {}
+        st.info(f"确定要将《{book.get('name', '该资料')}》导入馆藏吗？")
+    else:
+        st.session_state.pending_confirmation = None
+        return
+
+    confirm_col, cancel_col = st.columns(2)
+    if confirm_col.button("确定", type="primary", key="confirm_pending_action"):
+        if action == "delete_comment":
+            delete_comment(pending.get("comment_id", ""))
+        elif action == "submit_comment":
+            create_comment(
+                pending.get("isbn", ""),
+                None,
+                pending.get("subject", ""),
+                pending.get("content", ""),
+            )
+        elif action == "submit_reply":
+            create_comment(
+                pending.get("isbn", ""),
+                pending.get("parent_id"),
+                "",
+                pending.get("content", ""),
+            )
+            st.session_state.reply_target = None
+        elif action == "import_book":
+            if is_admin():
+                save_remote_book(pending.get("book") or {})
+        success_messages = {
+            "delete_comment": "留言已成功删除。",
+            "submit_comment": "留言已成功提交。",
+            "submit_reply": "回复已成功提交。",
+            "import_book": "书刊已成功导入馆藏。",
+        }
+        st.session_state.pending_confirmation = None
+        st.session_state.success_dialog_message = success_messages.get(action, "操作已成功完成。")
+        st.rerun()
+    if cancel_col.button("取消", key="cancel_pending_action"):
+        st.session_state.pending_confirmation = None
+        st.rerun()
+
+
+@st.dialog("操作成功")
+def success_dialog():
+    message = st.session_state.get("success_dialog_message")
+    if not message:
+        return
+    st.success(message)
+    if st.button("关闭", type="primary", key="close_success_dialog"):
+        st.session_state.success_dialog_message = None
+        st.rerun()
+
+
 def toggle_like(comment_id):
     user = current_user()
     if not user:
@@ -1332,8 +1400,7 @@ def render_comment_actions(comment, isbn, depth=0):
         toggle_like(comment["id"])
         st.rerun()
     if can_delete(comment) and columns[1].button("删除", key=f"delete_{comment['id']}"):
-        delete_comment(comment["id"])
-        st.rerun()
+        request_confirmation("delete_comment", comment_id=comment["id"])
     if current_user() and columns[2].button("回复", key=f"reply_{comment['id']}"):
         st.session_state.reply_target = comment["id"]
         st.rerun()
@@ -1344,10 +1411,14 @@ def render_comment_actions(comment, isbn, depth=0):
             content = st.text_area("回复内容", key=f"reply_text_{comment['id']}", height=70)
             if st.form_submit_button("提交回复"):
                 if content.strip():
-                    create_comment(isbn, comment["id"], "", content)
-                    st.session_state.reply_target = None
-                    st.rerun()
-                st.warning("回复内容不能为空。")
+                    request_confirmation(
+                        "submit_reply",
+                        isbn=isbn,
+                        parent_id=comment["id"],
+                        content=content,
+                    )
+                else:
+                    st.warning("回复内容不能为空。")
 
 
 def render_comment(comment, isbn, depth=0):
@@ -1419,9 +1490,14 @@ def show_book_page(isbn):
             content = st.text_area("留言内容")
             if st.form_submit_button("提交留言"):
                 if subject.strip() and content.strip():
-                    create_comment(isbn, None, subject, content)
-                    st.rerun()
-                st.warning("主题和留言内容不能为空。")
+                    request_confirmation(
+                        "submit_comment",
+                        isbn=isbn,
+                        subject=subject,
+                        content=content,
+                    )
+                else:
+                    st.warning("主题和留言内容不能为空。")
     else:
         st.info("登录后可以发布留言、点赞和回复。")
 def show_my_messages():
@@ -1842,10 +1918,7 @@ else:
                         "导入馆藏",
                         key=f"import_{book['isbn']}"
                 ):
-                    save_remote_book(book)
-                    st.session_state.remote_results = []
-                    st.success("书刊已自动导入馆藏。")
-                    st.rerun()
+                    request_confirmation("import_book", book=book)
             else:
                 user = current_user()
                 if not user:
@@ -1893,3 +1966,9 @@ else:
     st.info("暂无热门搜索。" if not hot_searches else "、".join(hot_searches))
     st.subheader("访问统计")
     st.info("暂无访问统计。" if not stats else f"累计访问：{stats}")
+
+
+if st.session_state.get("pending_confirmation"):
+    confirmation_dialog()
+elif st.session_state.get("success_dialog_message"):
+    success_dialog()
