@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 import streamlit as st
 
 
-st.set_page_config(page_title="图书馆跨时空留言板", page_icon="📚", layout="wide")
+st.set_page_config(page_title="让你的图书馆有个“伴”", page_icon="📚", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -2173,7 +2173,7 @@ with st.sidebar:
     st.file_uploader("上传旧照片", type=["jpg", "jpeg", "png"])
 
 
-st.title("图书馆跨时空留言板")
+st.title("让你的图书馆有个“伴”")
 page = st.session_state.page
 if st.session_state.current_book:
     show_book_page(st.session_state.current_book)
