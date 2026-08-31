@@ -15,6 +15,78 @@ import streamlit as st
 st.set_page_config(page_title="图书馆跨时空留言板", page_icon="📚", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def item_icon(item):
+    item_type = str(item.get("item_type", "book"))
+    if item_type == "journal":
+        return "📰"
+    if item_type == "journal_issue":
+        return "📰"
+    if item_type == "paper":
+        return "📄"
+    return "📚"
+
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --bg: #0B1220;
+        --surface: rgba(17, 24, 39, 0.78);
+        --border: rgba(148, 163, 184, 0.18);
+        --text: #E5E7EB;
+        --muted: #9CA3AF;
+        --accent: #22D3EE;
+        --accent-2: #A78BFA;
+        --accent-3: #34D399;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+    .stApp {
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background-image:
+            radial-gradient(circle at 10% 20%, rgba(34, 211, 238, 0.08), transparent 25%),
+            radial-gradient(circle at 90% 10%, rgba(167, 139, 250, 0.08), transparent 25%),
+            radial-gradient(circle at 50% 90%, rgba(52, 211, 153, 0.07), transparent 25%);
+    }
+    .tech-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 16px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(10px);
+        transition: transform .08s ease, box-shadow .15s ease, border-color .15s ease;
+    }
+    .tech-card:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+        border-color: rgba(148, 163, 184, 0.35);
+    }
+    .tech-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 12px;
+        border-radius: 999px;
+        background: rgba(34, 211, 238, 0.12);
+        color: var(--accent);
+        font-size: 0.85rem;
+        font-weight: 600;
+        border: 1px solid rgba(34, 211, 238, 0.25);
+    }
+    .tech-meta {
+        color: var(--muted);
+        font-size: 0.9rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 st.markdown(
     """
     <style>
@@ -842,7 +914,7 @@ def migrate_legacy_data(db):
                 if db.execute("SELECT 1 FROM books WHERE isbn=?", (str(isbn),)).fetchone() is None:
                     db.execute(
                         "INSERT INTO books(isbn,name,author,theme,icon,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
-                        (str(isbn), str(isbn), "", "", "📚", now_text()),
+                        (str(isbn), str(isbn), "", "", item_icon({"item_type": "book"}), now_text()),
                     )
                 for index, entry in enumerate(entries if isinstance(entries, list) else []):
                     migrate_comment(db, str(isbn), entry, None, f"legacy-{isbn}-{index}")
@@ -1601,13 +1673,13 @@ def show_book_page(isbn):
         return
     account = current_user().get("account") if current_user() else None
     comments = comment_tree(isbn, account)
-    st.header(f"{book['icon']} {book['name']}")
+    st.header(f"{item_icon(book)} {book['name']}")
     st.markdown(
         "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
-        f"<span class='tag'>{item_type_label(book)}</span>"
-        f"<span class='tag'>{item_creator_label(book)}：{book['author']}</span>"
-        f"<span class='tag'>主题：{book['theme']}</span>"
-        f"<span class='tag'>{item_identifier_text(book)}</span>"
+        f"<span class='tech-tag'>{item_type_label(book)}</span>"
+        f"<span class='tech-tag'>{item_creator_label(book)}：{book['author']}</span>"
+        f"<span class='tech-tag'>主题：{book['theme']}</span>"
+        f"<span class='tech-tag'>{item_identifier_text(book)}</span>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1702,7 +1774,7 @@ def show_my_reading():
         favorite = "已收藏" if item.get("is_favorite") else ""
         status = item.get("reading_status", "未设置")
         details = " · ".join(value for value in (favorite, status) if value)
-        st.write(f"{item['icon']} **{item['name']}** · {item_type_label(item)}")
+        st.write(f"{item_icon(item)} **{item['name']}** · {item_type_label(item)}")
         st.caption(f"{details} · {item_creator_label(item)}：{item['author']}")
         if st.button("查看详情", key=f"my_reading_{item['isbn']}"):
             open_catalog_item(item)
@@ -1743,7 +1815,7 @@ def show_book_admin():
         name = st.text_input("书名或期刊名")
         author = st.text_input("作者或出版机构")
         theme = st.text_input("主题")
-        icon = st.text_input("图标", value="📚")
+        icon = st.text_input("图标", value=("📰" if item_type == "journal" else "📚"))
         if st.form_submit_button("添加"):
             if not isbn.strip() or not name.strip():
                 st.error("标识符和名称不能为空。")
@@ -1757,7 +1829,7 @@ def show_book_admin():
                         st.stop()
                     identifier = f"ISSN:{normalized_issn}"
                     identifier_type = "ISSN"
-                chosen_icon = icon.strip() or ("📰" if item_type == "journal" else "📚")
+                chosen_icon = icon.strip() or item_icon({"item_type": item_type})
                 if item_type == "journal" and chosen_icon == "📚":
                     chosen_icon = "📰"
                 try:
@@ -1800,7 +1872,7 @@ def show_book_admin():
                         """,
                         (
                             name.strip(), author.strip(), theme.strip(),
-                            icon.strip() or ("📰" if item_type == "journal" else "📚"),
+                            icon.strip() or item_icon({"item_type": item_type}),
                             item_type, book.get("identifier_type", "ISBN"),
                             int(enabled), selected,
                         ),
@@ -1826,7 +1898,7 @@ def show_all_books():
     cols = st.columns(3)
     for index, book in enumerate(all_books):
         with cols[index % 3]:
-            st.write(f"{book['icon']} **{book['name']}**")
+            st.write(f"{item_icon(book)} **{book['name']}**")
             st.caption(
                 f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
                 f"留言 {comment_count(book['isbn'])}"
@@ -1841,7 +1913,7 @@ def show_journal_issues():
     if not journal:
         st.info("没有选择期刊。")
         return
-    st.header(f"{journal.get('icon', '📰')} {journal.get('name', '期刊')}：所有期次")
+    st.header(f"{item_icon(journal)} {journal.get('name', '期刊')}：所有期次")
     st.caption(
         f"出版机构：{journal.get('author', '未知出版机构')} · "
         f"{item_identifier_text(journal)}"
@@ -1861,7 +1933,7 @@ def show_journal_issues():
         return
     st.caption(f"共显示 {len(issues)} 个 Crossref 收录期次；每个期次都有独立留言区。")
     for issue in issues:
-        st.write(f"{issue['icon']} **{issue['name']}**")
+        st.write(f"{item_icon(issue)} **{issue['name']}**")
         st.caption(f"{item_identifier_text(issue)} · 留言 {comment_count(issue['isbn'])}")
         if issue.get("url"):
             st.caption(issue["url"])
@@ -2085,7 +2157,7 @@ else:
         st.subheader(f"搜索结果：{st.session_state.search_query}")
         for book in results:
             if st.button(
-                f"{book['icon']} {book['name']} · {item_type_label(book)} · "
+                f"{item_icon(book)} {book['name']} · {item_type_label(book)} · "
                 f"{item_identifier_text(book)}",
                 key=f"result_{book['isbn']}",
             ):
@@ -2097,7 +2169,7 @@ else:
 
         for book in remote_results:
             st.write(
-                f"{book['icon']} **{book['name']}**"
+                f"{item_icon(book)} **{book['name']}**"
                 f" · {item_type_label(book)}"
                 f" · {item_creator_label(book)}：{book['author']}"
                 f" · {item_identifier_text(book)}"
@@ -2148,7 +2220,7 @@ else:
         card_cols = st.columns(3, gap="medium")
         for index, book in enumerate(visible_books):
             with card_cols[index % 3], st.container(border=True):
-                st.markdown(f"### {book['icon']} {book['name']}")
+                st.markdown(f"### {item_icon(book)} {book['name']}")
                 st.caption(
                     f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
                     f"留言 {comment_count(book['isbn'])}"
