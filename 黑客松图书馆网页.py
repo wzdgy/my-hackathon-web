@@ -15,6 +15,7 @@ import streamlit as st
 st.set_page_config(page_title="图书馆跨时空留言板", page_icon="📚", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
+inject_modern_theme()
 DB_FILE = BASE_DIR / "library.db"
 LEGACY_MESSAGES = BASE_DIR / "messages_data.json"
 LEGACY_USERS = BASE_DIR / "users_data.json"
@@ -1550,9 +1551,14 @@ def show_book_page(isbn):
     account = current_user().get("account") if current_user() else None
     comments = comment_tree(isbn, account)
     st.header(f"{book['icon']} {book['name']}")
-    st.caption(
-        f"类型：{item_type_label(book)} · {item_creator_label(book)}：{book['author']} · "
-        f"主题：{book['theme']} · {item_identifier_text(book)}"
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
+        f"<span class='tag'>{item_type_label(book)}</span>"
+        f"<span class='tag'>{item_creator_label(book)}：{book['author']}</span>"
+        f"<span class='tag'>主题：{book['theme']}</span>"
+        f"<span class='tag'>{item_identifier_text(book)}</span>"
+        "</div>",
+        unsafe_allow_html=True,
     )
     if book.get("item_type") == "paper":
         if book.get("journal_name") or book.get("published_at"):
@@ -1572,22 +1578,27 @@ def show_book_page(isbn):
             help="知网页面会在新的浏览器标签页打开；返回本标签页即可继续评论。",
         )
     if current_user():
+        action_cols = st.columns([1, 2, 2], gap="small")
         item_state = user_item_state(account, isbn)
         favorite_label = "取消收藏" if item_state.get("is_favorite") else "收藏"
-        if st.button(favorite_label, key=f"favorite_{isbn}"):
+        if action_cols[0].button(favorite_label, key=f"favorite_{isbn}", type="secondary"):
             toggle_favorite(isbn)
             st.rerun()
         current_status = item_state.get("reading_status", "未设置")
-        with st.form(f"reading_status_form_{isbn}"):
-            status = st.selectbox(
+        with action_cols[1].form(f"reading_status_form_{isbn}"):
+            status = action_cols[1].selectbox(
                 "阅读状态",
                 READING_STATUSES,
                 index=READING_STATUSES.index(current_status)
                 if current_status in READING_STATUSES else 0,
+                label_visibility="collapsed",
             )
-            if st.form_submit_button("保存阅读状态"):
-                set_reading_status(isbn, status)
-                st.rerun()
+            action_cols[1].form_submit_button("保存阅读状态")
+        if action_cols[2].button("打开知网检索", key=f"cnki_action_{isbn}", type="primary"):
+            if book.get("source_url"):
+                st.markdown(f"[在新标签页打开]({book['source_url']})", unsafe_allow_html=True)
+            else:
+                st.info("该资料暂未配置可打开的来源链接。")
     st.subheader(f"留言（{len(comments)} 条）")
     if not comments:
         st.info("暂时没有留言。")
@@ -2080,18 +2091,20 @@ else:
 
     st.subheader("热门书刊")
     visible_books = popular_books(6)
-    cols = st.columns(3)
-    for index, book in enumerate(visible_books):
-        with cols[index % 3]:
-            st.write(f"{book['icon']} **{book['name']}**")
-            st.caption(
-                f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
-                f"留言 {comment_count(book['isbn'])}"
-            )
-            button_label = "查看所有期次" if book.get("item_type") == "journal" else "查看留言"
-            if st.button(button_label, key=f"book_{book['isbn']}"):
-                open_catalog_item(book)
-    if st.button("查看全部书刊"):
+    if not visible_books:
+        st.info("目前还没有热门书刊。")
+    else:
+        card_cols = st.columns(3, gap="medium")
+        for index, book in enumerate(visible_books):
+            with card_cols[index % 3], st.container(border=True):
+                st.markdown(f"### {book['icon']} {book['name']}")
+                st.caption(
+                    f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
+                    f"留言 {comment_count(book['isbn'])}"
+                )
+                button_label = "查看所有期次" if book.get("item_type") == "journal" else "查看留言"
+                st.button(button_label, key=f"book_{book['isbn']}", use_container_width=True)
+    if st.button("查看全部书刊", use_container_width=True):
         st.session_state.page = "全部书刊"
         st.session_state.current_book = None
         st.rerun()
