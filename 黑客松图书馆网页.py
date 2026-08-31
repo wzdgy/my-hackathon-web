@@ -707,6 +707,16 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_book_requests_status
             ON book_requests(status, created_at);
+            CREATE TABLE IF NOT EXISTS user_items (
+                account TEXT NOT NULL,
+                isbn TEXT NOT NULL REFERENCES books(isbn) ON DELETE CASCADE,
+                is_favorite INTEGER NOT NULL DEFAULT 0,
+                reading_status TEXT NOT NULL DEFAULT '未设置',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(account, isbn)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_items_account
+            ON user_items(account, is_favorite, reading_status, updated_at);
             """
         )
         ensure_column(db, "books", "item_type", "TEXT NOT NULL DEFAULT 'book'")
@@ -1169,6 +1179,88 @@ def open_book(isbn):
     st.rerun()
 
 
+READING_STATUSES = ("未设置", "想读", "在读", "已读", "暂停")
+
+
+def user_item_state(account, isbn):
+    if not account:
+        return {"is_favorite": 0, "reading_status": "未设置"}
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT is_favorite,reading_status FROM user_items WHERE account=? AND isbn=?",
+            (str(account), str(isbn)),
+        ).fetchone()
+    return dict(row) if row else {"is_favorite": 0, "reading_status": "未设置"}
+
+
+def save_user_item_state(account, isbn, is_favorite, reading_status):
+    if not account or not isbn:
+        return
+    is_favorite = int(bool(is_favorite))
+    reading_status = reading_status if reading_status in READING_STATUSES else "未设置"
+    with connect_db() as db:
+        if not is_favorite and reading_status == "未设置":
+            db.execute(
+                "DELETE FROM user_items WHERE account=? AND isbn=?",
+                (str(account), str(isbn)),
+            )
+            return
+        db.execute(
+            """
+            INSERT INTO user_items(account,isbn,is_favorite,reading_status,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(account,isbn) DO UPDATE SET
+                is_favorite=excluded.is_favorite,
+                reading_status=excluded.reading_status,
+                updated_at=excluded.updated_at
+            """,
+            (str(account), str(isbn), is_favorite, reading_status, now_text()),
+        )
+
+
+def toggle_favorite(isbn):
+    user = current_user()
+    if not user:
+        return
+    state = user_item_state(user["account"], isbn)
+    save_user_item_state(
+        user["account"],
+        isbn,
+        not bool(state.get("is_favorite")),
+        state.get("reading_status", "未设置"),
+    )
+
+
+def set_reading_status(isbn, reading_status):
+    user = current_user()
+    if not user:
+        return
+    state = user_item_state(user["account"], isbn)
+    save_user_item_state(
+        user["account"],
+        isbn,
+        state.get("is_favorite", 0),
+        reading_status,
+    )
+
+
+def user_item_rows(account):
+    if not account:
+        return []
+    with connect_db() as db:
+        rows = db.execute(
+            """
+            SELECT b.*,ui.is_favorite,ui.reading_status,ui.updated_at
+            FROM user_items ui JOIN books b ON b.isbn=ui.isbn
+            WHERE ui.account=? AND b.enabled=1
+              AND (ui.is_favorite=1 OR ui.reading_status!='未设置')
+            ORDER BY ui.is_favorite DESC,ui.updated_at DESC,b.name COLLATE NOCASE
+            """,
+            (str(account),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def back_home_button(key):
     if st.button("返回首页", key=key):
         st.session_state.page = "首页"
@@ -1479,6 +1571,23 @@ def show_book_page(isbn):
             cnki_search_url(book),
             help="知网页面会在新的浏览器标签页打开；返回本标签页即可继续评论。",
         )
+    if current_user():
+        item_state = user_item_state(account, isbn)
+        favorite_label = "取消收藏" if item_state.get("is_favorite") else "收藏"
+        if st.button(favorite_label, key=f"favorite_{isbn}"):
+            toggle_favorite(isbn)
+            st.rerun()
+        current_status = item_state.get("reading_status", "未设置")
+        with st.form(f"reading_status_form_{isbn}"):
+            status = st.selectbox(
+                "阅读状态",
+                READING_STATUSES,
+                index=READING_STATUSES.index(current_status)
+                if current_status in READING_STATUSES else 0,
+            )
+            if st.form_submit_button("保存阅读状态"):
+                set_reading_status(isbn, status)
+                st.rerun()
     st.subheader(f"留言（{len(comments)} 条）")
     if not comments:
         st.info("暂时没有留言。")
@@ -1514,6 +1623,27 @@ def show_my_messages():
     for row in rows:
         st.write(f"{row['subject'] or '回复'} · {row['created_at']} · 👍 {row['likes_count']}")
         st.write(row["content"])
+
+
+def show_my_reading():
+    back_home_button("home_from_my_reading")
+    user = current_user()
+    if not user:
+        st.info("请先登录。")
+        return
+    st.header("我的收藏/阅读")
+    rows = user_item_rows(user["account"])
+    if not rows:
+        st.info("暂时没有收藏或阅读记录。")
+        return
+    for item in rows:
+        favorite = "已收藏" if item.get("is_favorite") else ""
+        status = item.get("reading_status", "未设置")
+        details = " · ".join(value for value in (favorite, status) if value)
+        st.write(f"{item['icon']} **{item['name']}** · {item_type_label(item)}")
+        st.caption(f"{details} · {item_creator_label(item)}：{item['author']}")
+        if st.button("查看详情", key=f"my_reading_{item['isbn']}"):
+            open_catalog_item(item)
 
 
 def show_notifications():
@@ -1735,6 +1865,10 @@ def account_panel():
             st.session_state.page = "我的留言"
             st.session_state.current_book = None
             st.rerun()
+        if st.sidebar.button("我的收藏/阅读"):
+            st.session_state.page = "我的收藏/阅读"
+            st.session_state.current_book = None
+            st.rerun()
         if st.sidebar.button("退出登录"):
             st.session_state.user = None
             st.session_state.page = "首页"
@@ -1871,6 +2005,8 @@ if st.session_state.current_book:
     show_book_page(st.session_state.current_book)
 elif page == "我的留言":
     show_my_messages()
+elif page == "我的收藏/阅读":
+    show_my_reading()
 elif page == "通知":
     show_notifications()
 elif page == "书刊管理":
