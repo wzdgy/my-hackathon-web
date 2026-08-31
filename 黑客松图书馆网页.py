@@ -28,6 +28,45 @@ def item_icon(item):
     return "📚"
 
 
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"] {
+        min-width: 292px;
+        max-width: 320px;
+    }
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 8px;
+        padding-bottom: 8px;
+    }
+    [data-testid="stSidebar"] .stButton>button,[data-testid="stSidebar"] .stRadio>div,[data-testid="stSidebar"] .stForm>form {
+        width: 100%;
+    }
+    [data-testid="stSidebar"] .stButton>button {
+        border-radius: 10px;
+        padding: 0.55rem 0.7rem;
+        margin: 2px 0;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.06);
+        color: inherit;
+    }
+    [data-testid="stSidebar"] .stDivider {
+        margin: 14px 0;
+    }
+    .tech-card {
+        min-height: 210px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+    .tech-card .stButton>button {
+        margin-top: 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.markdown(
     """
     <style>
@@ -1610,14 +1649,14 @@ def render_reply(reply, isbn, depth):
 
 
 def render_comment_actions(comment, isbn, depth=0):
-    columns = st.columns([1, 1, 1, 5])
+    columns = st.columns(4, gap="small")
     label = "取消点赞" if comment.get("liked") else "点赞"
-    if columns[0].button(f"{label}（{comment['likes_count']}）", key=f"like_{comment['id']}"):
+    if columns[0].button(f"{label}（{comment['likes_count']}）", key=f"like_{comment['id']}", use_container_width=True):
         toggle_like(comment["id"])
         st.rerun()
-    if can_delete(comment) and columns[1].button("删除", key=f"delete_{comment['id']}"):
+    if can_delete(comment) and columns[1].button("删除", key=f"delete_{comment['id']}", use_container_width=True):
         request_confirmation("delete_comment", comment_id=comment["id"])
-    if current_user() and columns[2].button("回复", key=f"reply_{comment['id']}"):
+    if current_user() and columns[2].button("回复", key=f"reply_{comment['id']}", use_container_width=True):
         st.session_state.reply_target = comment["id"]
         st.rerun()
     elif not current_user():
@@ -1701,22 +1740,23 @@ def show_book_page(isbn):
             help="知网页面会在新的浏览器标签页打开；返回本标签页即可继续评论。",
         )
     if current_user():
-        action_cols = st.columns([1, 2, 2], gap="small")
+        action_cols = st.columns([1, 1, 1], gap="small")
         item_state = user_item_state(account, isbn)
         favorite_label = "取消收藏" if item_state.get("is_favorite") else "收藏"
         if action_cols[0].button(favorite_label, key=f"favorite_{isbn}", type="secondary"):
             toggle_favorite(isbn)
             st.rerun()
         current_status = item_state.get("reading_status", "未设置")
-        with action_cols[1].form(f"reading_status_form_{isbn}"):
-            status = action_cols[1].selectbox(
-                "阅读状态",
-                READING_STATUSES,
-                index=READING_STATUSES.index(current_status)
-                if current_status in READING_STATUSES else 0,
-                label_visibility="collapsed",
-            )
-            action_cols[1].form_submit_button("保存阅读状态")
+        status = action_cols[1].selectbox(
+            "阅读状态",
+            READING_STATUSES,
+            index=READING_STATUSES.index(current_status)
+            if current_status in READING_STATUSES else 0,
+            label_visibility="collapsed",
+        )
+        if action_cols[1].button("保存阅读状态", key=f"save_status_{isbn}"):
+            set_reading_status(isbn, status)
+            st.rerun()
         if action_cols[2].button("打开知网检索", key=f"cnki_action_{isbn}", type="primary"):
             if book.get("source_url"):
                 st.markdown(f"[在新标签页打开]({book['source_url']})", unsafe_allow_html=True)
@@ -2221,9 +2261,9 @@ else:
         for index, book in enumerate(visible_books):
             with card_cols[index % 3], st.container(border=True):
                 st.markdown(f"### {item_icon(book)} {book['name']}")
-                st.caption(
-                    f"{item_type_label(book)} · {book['author']} · {book['theme']} · "
-                    f"留言 {comment_count(book['isbn'])}"
+                st.markdown(
+                    f"<div class='tech-meta'>{item_type_label(book)} · {book['author']} · {book['theme']} · 留言 {comment_count(book['isbn'])}</div>",
+                    unsafe_allow_html=True,
                 )
                 button_label = "查看所有期次" if book.get("item_type") == "journal" else "查看留言"
                 st.button(button_label, key=f"book_{book['isbn']}", use_container_width=True)
