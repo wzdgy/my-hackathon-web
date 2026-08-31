@@ -15,7 +15,58 @@ import streamlit as st
 st.set_page_config(page_title="图书馆跨时空留言板", page_icon="📚", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
-inject_modern_theme()
+st.markdown(
+    """
+    <style>
+    :root {
+        --bg: #F8FAFC;
+        --surface: #FFFFFF;
+        --border: #E5E7EB;
+        --text: #111827;
+        --muted: #6B7280;
+        --accent: #4F46E5;
+        --accent-soft: #EEF2FF;
+    }
+    .stApp {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        transition: transform .08s ease, box-shadow .15s ease;
+    }
+    .card:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+    }
+    .tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+    .meta {
+        color: var(--muted);
+        font-size: 0.9rem;
+    }
+    .page-title {
+        font-weight: 800;
+        letter-spacing: -0.2px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 DB_FILE = BASE_DIR / "library.db"
 LEGACY_MESSAGES = BASE_DIR / "messages_data.json"
 LEGACY_USERS = BASE_DIR / "users_data.json"
